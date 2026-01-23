@@ -45,3 +45,35 @@ sudo ./scripts/capture.sh eth0 30509
 - Stage 2: implement a minimal SOME/IP-like header and a simple Service Discovery demo over multicast.
 - Stage 3: keep the same signal catalog but place it inside SOME/IP-like events.
 - Stage 4: optional E2E-like counter + CRC inside payload (CAN-like robustness).
+
+## Hybrid UDP/TCP (Stage 1.5)
+
+Adds a config-driven hybrid approach:
+- UDP **events** (periodic publish/subscribe)
+- TCP **methods** (request/response)
+
+Configuration:
+- Signals: `configs/signals.yaml`
+- Message groups + transports: `configs/messages.yaml`
+
+Run hybrid service (WSL localhost demo):
+```bash
+source .venv/bin/activate
+PYTHONPATH=src python -m autoeth.hybrid_service --udp-dest-ip 127.0.0.1 --verbose
+```
+
+In another terminal, issue a TCP method command and optionally listen to UDP:
+```bash
+source .venv/bin/activate
+PYTHONPATH=src python -m autoeth.hybrid_client --tcp-server-ip 127.0.0.1 --tcp-port 30510 --set-steer-deg 25 --udp-sub
+```
+
+Raspberry Pi LAN:
+- Start service on Pi:
+  ```bash
+  PYTHONPATH=src python -m autoeth.hybrid_service --udp-iface eth0 --udp-dest-ip <peer_ip_if_unicast> --verbose
+  ```
+- Point client to Pi:
+  ```bash
+  PYTHONPATH=src python -m autoeth.hybrid_client --tcp-server-ip <pi_ip> --tcp-port 30510 --set-steer-deg 5 --udp-sub
+  ```

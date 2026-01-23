@@ -16,3 +16,14 @@ Artifacts:
 - src/autoeth/udp_pub.py: publisher
 - src/autoeth/udp_sub.py: subscriber
 - scripts/capture.sh: tcpdump helper
+
+## Stage 1.5 (Hybrid UDP/TCP)
+
+Adds config-driven message groups (`configs/messages.yaml`):
+
+- UDP **event** message groups for periodic / streaming signals (publish-subscribe).
+- TCP **method** request/response message groups for reliable commands/config transfers.
+
+TCP uses length-prefixed framing:
+- [u32_be length][frame_bytes...]
+where `frame_bytes` uses the same `codec.encode_frame()` header+payload format.

@@ -1,0 +1,49 @@
+# Message groups + transport configuration (hybrid UDP/TCP)
+#
+# Design rule:
+# - Signals are defined in signals.yaml
+# - Messages group signals and choose transport semantics (event via UDP, method via TCP)
+#
+# msg_id is stored in the existing codec header field "msg_type" (u8). Keep values 0..255.
+#
+transports:
+  udp:
+    default_ttl: 1
+  tcp:
+    listen_ip: 0.0.0.0
+    reconnect_ms: 500
+    read_timeout_ms: 2000
+
+messages:
+  # UDP event-style stream (periodic / publish-subscribe)
+  - name: fast_dynamics_event
+    msg_id: 1
+    kind: event
+    transport: udp
+    mode: multicast         # multicast | unicast
+    mcast_group: 239.255.0.1
+    port: 30509
+    period_ms: 50
+    signals:
+      - vehicle_speed_kph
+      - engine_rpm
+      - steering_angle_deg
+
+  # TCP method-style request/response
+  - name: control_method_req
+    msg_id: 2
+    kind: method_request
+    transport: tcp
+    port: 30510
+    timeout_ms: 200
+    signals:
+      - steering_angle_deg
+
+  - name: control_method_rsp
+    msg_id: 3
+    kind: method_response
+    transport: tcp
+    port: 30510
+    timeout_ms: 200
+    signals:
+      - steering_angle_deg

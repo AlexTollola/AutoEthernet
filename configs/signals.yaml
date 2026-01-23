@@ -1,5 +1,3 @@
-# DBC-like signal catalog for demo payloads
-# scale/offset are applied as: physical = raw * scale + offset
 signals:
   - name: vehicle_speed_kph
     type: u16

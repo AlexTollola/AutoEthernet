@@ -1,20 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Sequence
 
-from .signal_catalog import SignalDef
+from autoeth.core.config import SignalDef
 
 
 @dataclass(frozen=True)
-class CatalogIndex:
+class SignalIndex:
     by_name: Dict[str, SignalDef]
 
     @staticmethod
-    def from_catalog(catalog: List[SignalDef]) -> "CatalogIndex":
-        return CatalogIndex(by_name={s.name: s for s in catalog})
+    def from_signals(signals: Sequence[SignalDef]) -> "SignalIndex":
+        return SignalIndex(by_name={s.name: s for s in signals})
 
-    def subset(self, names: List[str]) -> List[SignalDef]:
+    def subset(self, names: Sequence[str]) -> List[SignalDef]:
         out: List[SignalDef] = []
         for n in names:
             try:
@@ -22,3 +22,4 @@ class CatalogIndex:
             except KeyError as e:
                 raise KeyError(f"signal not found in catalog: {n}") from e
         return out
+

@@ -1,14 +1,10 @@
-__all__ = ["codec", "signal_catalog", "udp_pub", "udp_sub"]
-# Hybrid Stage 1.5 modules
-__all__ = [
-    "codec",
-    "signal_catalog",
-    "udp_pub",
-    "udp_sub",
-    "message_config",
-    "hybrid_common",
-    "udp_transport",
-    "tcp_stream",
-    "hybrid_service",
-    "hybrid_client",
-]
+"""autoeth - Automotive Ethernet learning project (Python).
+
+Simple layered architecture:
+  - autoeth.core.transport       : UDP/TCP primitives
+  - autoeth.core.serialization   : DBC-like signal encoding/decoding
+  - autoeth.core.config          : single-file catalog loader (used in later steps)
+  - autoeth.protocols.someip     : protocol wrappers (used in later steps)
+"""
+
+__all__ = ["core", "protocols"]

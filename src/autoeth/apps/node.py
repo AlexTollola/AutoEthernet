@@ -13,6 +13,8 @@ from autoeth.core.serialization.index import SignalIndex
 from autoeth.core.transport.tcp import TcpServer, recv_frame, send_frame
 from autoeth.core.transport import udp as udp_transport
 from autoeth.core.validation.frame import PROTO_VER, pack_header, unpack_header, header_size
+from autoeth.core.validation.e2e import unwrap as e2e_unwrap, wrap as e2e_wrap
+
 
 
 def _method_by_id(cat: Catalog) -> Dict[int, MessageDef]:
@@ -26,6 +28,8 @@ def _udp_events(cat: Catalog) -> List[MessageDef]:
 def _init_state(signals: List[SignalDef]) -> Dict[str, float]:
     return {s.name: float(s.default) for s in signals}
 
+def _e2e_enabled(msg: MessageDef) -> bool:
+    return bool((msg.e2e or {}).get("enabled", False))
 
 def _tcp_handler(
     conn: socket.socket,
@@ -68,13 +72,28 @@ def _tcp_handler(
                     print(f"[tcp] drop {msg.name}: proto_ver={hdr.proto_ver} != {PROTO_VER}")
                 continue
 
-            exp = encoded_size(sigs)
+            exp = encoded_size(sigs) + (4 if _e2e_enabled(msg) else 0)
             if len(pl) != exp:
                 if verbose:
                     print(f"[tcp] drop {msg.name}: payload_len={len(pl)} expected={exp}")
                 continue
 
-            values = decode(sigs, pl)
+            if _e2e_enabled(msg):
+                try:
+                    pl_core, counter = e2e_unwrap(pl)
+                except Exception as e:
+                    if verbose:
+                        print(f"[tcp] drop {msg.name}: {e}")
+                    continue
+                if counter != hdr.seq:
+                    if verbose:
+                        print(f"[tcp] drop {msg.name}: counter({counter}) != seq({hdr.seq})")
+                    continue
+            else:
+                pl_core = pl
+
+            values = decode(sigs, pl_core)
+
 
         except Exception as e:
             if verbose:
@@ -90,6 +109,9 @@ def _tcp_handler(
             print(f"[tcp] rx method {msg.name} id={msg_id} values={values}")
 
         rsp_pl = encode(sigs, values)
+        if _e2e_enabled(msg):
+            rsp_pl = e2e_wrap(rsp_pl, counter=hdr.seq)
+
         rsp = bytes([msg_id]) + pack_header(seq=hdr.seq) + rsp_pl
         send_frame(conn, rsp)
 
@@ -150,8 +172,12 @@ class UdpEventPublisher(threading.Thread):
             with self.state_lock:
                 vals = {s.name: float(self.state.get(s.name, s.default)) for s in self.sigs}
 
-            payload = encode(self.sigs, vals)
             self.seq = (self.seq + 1) & 0xFFFF
+
+            payload = encode(self.sigs, vals)
+            if _e2e_enabled(self.msg):
+                payload = e2e_wrap(payload, counter=self.seq)
+
             datagram = bytes([self.msg.msg_id]) + pack_header(seq=self.seq) + payload
 
             try:

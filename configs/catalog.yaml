@@ -49,6 +49,9 @@ messages:
       - vehicle_speed_kph
       - engine_rpm
       - steering_angle_deg
+    e2e:
+      enabled: true
+      crc16: ccitt-false
 
   - name: control_method
     msg_id: 2
@@ -62,4 +65,7 @@ messages:
       method_id: 0x0200
     signals:
       - steering_angle_deg
+    e2e:
+      enabled: true
+      crc16: ccitt-false
 

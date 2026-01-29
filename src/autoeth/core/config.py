@@ -48,6 +48,9 @@ class MessageDef:
     tcp: Optional[Dict[str, Any]] = None
     someip: Optional[Dict[str, Any]] = None
 
+    e2e: Optional[Dict[str, Any]] = None
+
+
 
 @dataclass(frozen=True)
 class Catalog:
@@ -125,6 +128,12 @@ class Catalog:
             if m.kind == "method":
                 if m.transport == "udp":
                     raise ValueError(f"{m.name}: method over udp not supported in this project")
+                
+            e2e = m.e2e or {}
+            if e2e.get("enabled", False):
+                algo = str(e2e.get("crc16", "ccitt-false"))
+                if algo != "ccitt-false":
+                    raise ValueError(f"{m.name}.e2e.crc16 must be 'ccitt-false'")
 
         # services unique name
         svc_names = [s.name for s in self.services]
@@ -172,6 +181,7 @@ def load_catalog(path: str | Path) -> Catalog:
             tcp=m.get("tcp"),
             someip=m.get("someip"),
             signals=[str(x) for x in m.get("signals", [])],
+            e2e=m.get("e2e"),
         )
         for m in raw.get("messages", [])
     ]

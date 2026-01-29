@@ -2,16 +2,15 @@ from __future__ import annotations
 
 import argparse
 import socket
-from tabnanny import verbose
 from typing import Dict, Optional
 
 from autoeth.core.config import MessageDef, load_catalog
-from autoeth.core.serialization.codec import decode, encode
+from autoeth.core.serialization.codec import decode, encode, encoded_size
 from autoeth.core.serialization.index import SignalIndex
 from autoeth.core.transport.tcp import recv_frame, send_frame
 from autoeth.core.transport.udp import join_multicast
 from autoeth.core.validation.frame import PROTO_VER, pack_header, unpack_header
-from autoeth.core.serialization.codec import encoded_size
+from autoeth.core.validation.e2e import unwrap as e2e_unwrap, wrap as e2e_wrap
 
 
 
@@ -28,6 +27,9 @@ def _find_event(cat, name: str) -> MessageDef:
             return m
     raise SystemExit(f"Event not found: {name}")
 
+def _e2e_enabled(msg: MessageDef) -> bool:
+    return bool((msg.e2e or {}).get("enabled", False))
+
 
 def _tcp_call(
     *,
@@ -40,7 +42,13 @@ def _tcp_call(
     verbose: bool,
 ) -> Dict[str, float]:
     tcp_cfg = method.tcp or {}
-    port = int(tcp_port if tcp_port is not None else tcp_cfg.get("port"))
+    port_value = tcp_port if tcp_port is not None else tcp_cfg.get("port")
+    if port_value is None:
+        raise SystemExit(f"{method.name}: missing tcp.port")
+    try:
+        port = int(port_value)
+    except (TypeError, ValueError):
+        raise SystemExit(f"{method.name}: invalid tcp.port {port_value!r}")
     if not port:
         raise SystemExit(f"{method.name}: missing tcp.port")
     to_ms = int(tcp_cfg.get("timeout_ms", timeout_ms))
@@ -48,8 +56,10 @@ def _tcp_call(
     sigs = sig_index.subset(method.signals)
     payload = encode(sigs, values)
     seq = 1
-    frame = bytes([method.msg_id]) + pack_header(seq=seq) + payload
+    if _e2e_enabled(method):
+        payload = e2e_wrap(payload, counter=seq)
 
+    frame = bytes([method.msg_id]) + pack_header(seq=seq) + payload
 
     if verbose:
         print(f"[tcp] connect {tcp_ip}:{port} method={method.name} id={method.msg_id} values={values}")
@@ -74,11 +84,18 @@ def _tcp_call(
     if hdr.seq != seq:
         raise SystemExit(f"TCP: seq mismatch {hdr.seq} != {seq}")
 
-    exp = encoded_size(sigs)
+    exp = encoded_size(sigs) + (4 if _e2e_enabled(method) else 0)
     if len(pl) != exp:
         raise SystemExit(f"TCP: payload len mismatch {len(pl)} != {exp}")
 
-    vals = decode(sigs, pl)
+    if _e2e_enabled(method):
+        pl_core, counter = e2e_unwrap(pl)
+        if counter != hdr.seq:
+            raise SystemExit(f"TCP: counter({counter}) != seq({hdr.seq})")
+    else:
+        pl_core = pl
+
+    vals = decode(sigs, pl_core)
 
     if verbose:
         print(f"[tcp] rsp id={rsp_id} values={vals}")
@@ -139,20 +156,37 @@ def _udp_subscribe(
             continue
 
         hdr, pl = unpack_header(data[1:])
+
+        # Check protocol version early
         if hdr.proto_ver != PROTO_VER:
             if verbose:
                 print(f"[udp] drop proto_ver={hdr.proto_ver}")
             continue
 
-        exp = encoded_size(sigs)
+        # Length check (includes E2E trailer when enabled)
+        exp = encoded_size(sigs) + (4 if _e2e_enabled(event) else 0)
         if len(pl) != exp:
             if verbose:
                 print(f"[udp] drop len={len(pl)} expected={exp}")
             continue
 
-        vals = decode(sigs, pl)
+        # Optional E2E unwrap + counter check
+        if _e2e_enabled(event):
+            try:
+                pl_core, counter = e2e_unwrap(pl)
+            except Exception as e:
+                if verbose:
+                    print(f"[udp] drop e2e: {e}")
+                continue
+            if counter != hdr.seq:
+                if verbose:
+                    print(f"[udp] drop counter({counter}) != seq({hdr.seq})")
+                continue
+        else:
+            pl_core = pl
 
-        print(f"[udp] rx from={addr} id={msg_id} values={vals}")
+        vals = decode(sigs, pl_core)
+        print(f"[udp] rx from={addr} id={msg_id} seq={hdr.seq} values={vals}")
         got += 1
 
     s.close()

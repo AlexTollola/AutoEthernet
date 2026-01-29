@@ -52,3 +52,13 @@ def _fmt(sig_type: str):
         raise ValueError(f"unsupported signal type: {sig_type}")
     return _FMT[sig_type]
 
+
+def encoded_size(signals: List[SignalDef]) -> int:
+    """Return expected encoded payload size in bytes for the signal list."""
+    size = 0
+    for s in signals:
+        fmt, _, _ = _fmt(s.type)
+        size += struct.calcsize(fmt)
+    return size
+
+

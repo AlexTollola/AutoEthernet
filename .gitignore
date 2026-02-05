@@ -1,8 +1,11 @@
 .venv/
+.w_venv/
+.l_venv/
 __pycache__/
 *.pyc
 .pytest_cache/
 dist/
 build/
+autoeth.egg-info/
 *.pcap
 *.pcapng

@@ -11,7 +11,7 @@ from autoeth.core.transport.tcp import recv_frame, send_frame
 from autoeth.core.transport.udp import join_multicast
 from autoeth.core.validation.frame import PROTO_VER, pack_header, unpack_header
 from autoeth.core.validation.e2e import unwrap as e2e_unwrap, wrap as e2e_wrap
-
+from autoeth.core.service.discovery import SdAnnounce, parse_sd_datagram
 
 
 def _find_method(cat, name: str) -> MessageDef:
@@ -192,6 +192,30 @@ def _udp_subscribe(
     s.close()
 
 
+def _discover(*, group: str, port: int, bind_ip: str, iface_ip: str, timeout_s: float, verbose: bool):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.settimeout(timeout_s)
+    s.bind((bind_ip, port))
+
+    join_multicast(s, group, iface_ip=iface_ip)
+
+    if verbose:
+        print(f"[sd] listen {bind_ip}:{port} group={group} iface_ip={iface_ip}")
+
+    while True:
+        data, addr = s.recvfrom(2048)
+        parsed = parse_sd_datagram(data)
+        if not parsed:
+            continue
+        seq, ann = parsed
+        if verbose:
+            print(f"[sd] rx from={addr} seq={seq} ann={ann}")
+        s.close()
+        # Use source IP as the server IP (most reliable)
+        return addr[0], int(ann.tcp_port), ann
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="AutoEth Client (TCP method call + UDP subscribe)")
     ap.add_argument("--catalog", default="configs/catalog.yaml")
@@ -209,6 +233,11 @@ def main() -> int:
     ap.add_argument("--count", type=int, default=5)
     ap.add_argument("--udp-timeout-s", type=float, default=2.0)
 
+    ap.add_argument("--discover", action="store_true", help="listen for SD announce and auto-fill tcp-ip/port")
+    ap.add_argument("--sd-group", default="239.0.0.2")
+    ap.add_argument("--sd-port", type=int, default=30490)
+    ap.add_argument("--sd-timeout-s", type=float, default=2.0)
+
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -216,6 +245,24 @@ def main() -> int:
     cat.validate()
 
     sig_index = SignalIndex.from_signals(cat.signals)
+
+    discovered = None
+    if args.discover:
+        tcp_ip, tcp_port_disc, ann = _discover(
+            group=args.sd_group,
+            port=args.sd_port,
+            bind_ip="0.0.0.0",
+            iface_ip=args.iface_ip,
+            timeout_s=args.sd_timeout_s,
+            verbose=args.verbose,
+        )
+        discovered = (tcp_ip, tcp_port_disc, ann)
+
+        # If user didn't explicitly set tcp-ip/port, override.
+        if args.tcp_ip == "127.0.0.1":
+            args.tcp_ip = tcp_ip
+        if args.tcp_port is None:
+            args.tcp_port = tcp_port_disc
 
     # TCP call
     if args.call_method:

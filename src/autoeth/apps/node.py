@@ -14,6 +14,8 @@ from autoeth.core.transport.tcp import TcpServer, recv_frame, send_frame
 from autoeth.core.transport import udp as udp_transport
 from autoeth.core.validation.frame import PROTO_VER, pack_header, unpack_header, header_size
 from autoeth.core.validation.e2e import unwrap as e2e_unwrap, wrap as e2e_wrap
+from autoeth.core.service.discovery import SdAnnounce, build_sd_datagram
+
 
 
 
@@ -192,6 +194,67 @@ class UdpEventPublisher(threading.Thread):
             pass
 
 
+class SdAnnouncer(threading.Thread):
+    def __init__(
+        self,
+        *,
+        service_id: int,
+        instance_id: int,
+        tcp_port: int,
+        event_port: int,
+        udp_mode: int,
+        mcast_group: str,
+        flags: int,
+        group_ip: str,
+        group_port: int,
+        iface: str | None,
+        ttl: int,
+        stop_evt: threading.Event,
+        verbose: bool,
+    ):
+        super().__init__(daemon=True)
+        self.ann = SdAnnounce(
+            service_id=service_id,
+            instance_id=instance_id,
+            tcp_port=tcp_port,
+            event_port=event_port,
+            mcast_group=mcast_group,
+            udp_mode=udp_mode,
+            flags=flags,
+        )
+        self.dest = (group_ip, int(group_port))
+        self.stop_evt = stop_evt
+        self.verbose = verbose
+        self.sock = udp_transport.make_socket(iface=iface, ttl=ttl, bind_ip="0.0.0.0", bind_port=0)
+        self.seq = 0
+
+    def run(self) -> None:
+        if self.verbose:
+            print(f"[sd] announce -> {self.dest} every 1000ms payload={self.ann}")
+
+        next_t = time.monotonic()
+        while not self.stop_evt.is_set():
+            now = time.monotonic()
+            if now < next_t:
+                self.stop_evt.wait(next_t - now)
+                continue
+            next_t += 1.0  # 1000 ms
+
+            d = build_sd_datagram(seq=self.seq, ann=self.ann)
+            try:
+                self.sock.sendto(d, self.dest)
+            except OSError as e:
+                if self.verbose:
+                    print(f"[sd] send error: {e}")
+
+            self.seq = (self.seq + 1) & 0xFFFF
+
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="AutoEth Node (TCP methods + UDP events)")
     ap.add_argument("--catalog", default="configs/catalog.yaml", help="canonical catalog YAML")
@@ -237,8 +300,53 @@ def main() -> int:
     srv = TcpServer(listen_ip=args.listen_ip, port=tcp_port, handler=_handler)
     srv.start()
 
-    # UDP publishers (events)
+    # Determine a "primary" UDP event to announce (first UDP event in catalog)
     udp_msgs = _udp_events(cat)
+    if not udp_msgs:
+        raise SystemExit("No UDP events found in catalog (kind=event, transport=udp).")
+    first_event = udp_msgs[0]
+    udp_cfg = first_event.udp or {}
+    event_port = int(udp_cfg.get("port", 0))
+    udp_mode = 1 if str(udp_cfg.get("mode", "unicast")) == "multicast" else 0
+    mcast_group = str(udp_cfg.get("mcast_group", "0.0.0.0")) if udp_mode == 1 else "0.0.0.0"
+
+    # Service IDs (first service in catalog)
+    svc_id = 0
+    inst_id = 0
+    if getattr(cat, "services", None):
+        s0 = cat.services[0]
+        svc_id = int(getattr(s0, "service_id", 0))
+        inst_id = int(getattr(s0, "instance_id", 0))
+
+    # Flags: bit0=event E2E enabled, bit1=method E2E enabled
+    event_e2e = 1 if _e2e_enabled(first_event) else 0
+    method_e2e = 1 if _e2e_enabled(first_method) else 0
+    flags = (event_e2e << 0) | (method_e2e << 1)
+
+    # SD multicast (use a dedicated group/port)
+    sd_group = "239.0.0.2"
+    sd_port = 30490
+    sd_iface = str(udp_cfg.get("iface")) if udp_mode == 1 else None
+    sd_ttl = int(udp_cfg.get("ttl", 1))
+
+    sd = SdAnnouncer(
+        service_id=svc_id,
+        instance_id=inst_id,
+        tcp_port=int(tcp_port),
+        event_port=int(event_port),
+        udp_mode=int(udp_mode),
+        mcast_group=mcast_group,
+        flags=int(flags),
+        group_ip=sd_group,
+        group_port=sd_port,
+        iface=sd_iface,
+        ttl=sd_ttl,
+        stop_evt=stop_evt,
+        verbose=args.verbose,
+    )
+    sd.start()
+
+    # UDP publishers (events)
     udp_threads: List[UdpEventPublisher] = []
     for m in udp_msgs:
         sigs = sig_index.subset(m.signals)

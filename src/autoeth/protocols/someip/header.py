@@ -83,5 +83,13 @@ def build_message(
 def parse_message(data: bytes) -> Tuple[SomeIpHeader, bytes]:
     hdr = SomeIpHeader.unpack(data)
     payload = data[_HDR.size:]
+
+    expected = hdr.length - 8
+    if expected < 0:
+        raise ValueError("SOME/IP invalid length")
+    if len(payload) < expected:
+        raise ValueError("SOME/IP truncated payload")
+    payload = payload[:expected]
     return hdr, payload
+
 

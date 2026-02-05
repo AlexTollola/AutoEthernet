@@ -15,6 +15,7 @@ from autoeth.core.transport import udp as udp_transport
 from autoeth.core.validation.frame import PROTO_VER, pack_header, unpack_header, header_size
 from autoeth.core.validation.e2e import unwrap as e2e_unwrap, wrap as e2e_wrap
 from autoeth.core.service.discovery import SdAnnounce, build_sd_datagram
+from autoeth.protocols.someip.header import build_message, MT_NOTIFICATION
 
 
 
@@ -125,6 +126,7 @@ class UdpEventPublisher(threading.Thread):
     def __init__(
         self,
         *,
+        cat: Catalog,
         msg: MessageDef,
         sigs: List[SignalDef],
         state: Dict[str, float],
@@ -134,6 +136,7 @@ class UdpEventPublisher(threading.Thread):
         verbose: bool,
     ):
         super().__init__(daemon=True)
+        self.cat = cat
         self.msg = msg
         self.sigs = sigs
         self.state = state
@@ -174,13 +177,29 @@ class UdpEventPublisher(threading.Thread):
             with self.state_lock:
                 vals = {s.name: float(self.state.get(s.name, s.default)) for s in self.sigs}
 
+            svc = (self.cat.someip or {})
+            svc_id = int(svc.get("service_id", 0))
+            iface_ver = int(svc.get("iface_ver", 1))
+
+            method_id = int(self.msg.someip_method_id or 0)
+            if method_id == 0:
+                raise RuntimeError(f"{self.msg.name}: missing someip_method_id in catalog")
+
             self.seq = (self.seq + 1) & 0xFFFF
 
             payload = encode(self.sigs, vals)
             if _e2e_enabled(self.msg):
                 payload = e2e_wrap(payload, counter=self.seq)
 
-            datagram = bytes([self.msg.msg_id]) + pack_header(seq=self.seq) + payload
+            datagram = build_message(
+                service_id=svc_id,
+                method_id=method_id,
+                client_id=0x0000,
+                session_id=self.seq,
+                iface_ver=iface_ver,
+                msg_type=MT_NOTIFICATION,
+                payload=payload,
+            )
 
             try:
                 self.sock.sendto(datagram, self.dest)
@@ -351,6 +370,7 @@ def main() -> int:
     for m in udp_msgs:
         sigs = sig_index.subset(m.signals)
         t = UdpEventPublisher(
+            cat=cat,
             msg=m,
             sigs=sigs,
             state=state,

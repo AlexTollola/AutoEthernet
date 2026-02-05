@@ -4,7 +4,7 @@ import argparse
 import socket
 from typing import Dict, Optional
 
-from autoeth.core.config import MessageDef, load_catalog
+from autoeth.core.config import Catalog, MessageDef, load_catalog
 from autoeth.core.serialization.codec import decode, encode, encoded_size
 from autoeth.core.serialization.index import SignalIndex
 from autoeth.core.transport.tcp import recv_frame, send_frame
@@ -12,6 +12,7 @@ from autoeth.core.transport.udp import join_multicast
 from autoeth.core.validation.frame import PROTO_VER, pack_header, unpack_header
 from autoeth.core.validation.e2e import unwrap as e2e_unwrap, wrap as e2e_wrap
 from autoeth.core.service.discovery import SdAnnounce, parse_sd_datagram
+from autoeth.protocols.someip.header import MT_NOTIFICATION, parse_message
 
 
 def _find_method(cat, name: str) -> MessageDef:
@@ -104,6 +105,7 @@ def _tcp_call(
 
 def _udp_subscribe(
     *,
+    cat: Catalog,
     event: MessageDef,
     sig_index: SignalIndex,
     bind_ip: str,
@@ -146,47 +148,34 @@ def _udp_subscribe(
             print("[udp] timeout waiting for datagram")
             continue
 
-        if len(data) < 1:
-            continue
+        svc = (cat.someip or {})
+        svc_id = int(svc.get("service_id", 0))
+        method_id = int(event.someip_method_id or 0)
 
-        msg_id = data[0]
-        if msg_id != event.msg_id:
+        hdr, payload = parse_message(data)
+
+        if hdr.service_id != svc_id or hdr.method_id != method_id or hdr.msg_type != MT_NOTIFICATION:
             if verbose:
-                print(f"[udp] rx other msg_id={msg_id} from={addr} len={len(data)}")
+                print(
+                    f"[udp] drop someip sid={hdr.service_id:04X} mid={hdr.method_id:04X} type={hdr.msg_type:02X}"
+                )
             continue
 
-        hdr, pl = unpack_header(data[1:])
-
-        # Check protocol version early
-        if hdr.proto_ver != PROTO_VER:
-            if verbose:
-                print(f"[udp] drop proto_ver={hdr.proto_ver}")
-            continue
-
-        # Length check (includes E2E trailer when enabled)
-        exp = encoded_size(sigs) + (4 if _e2e_enabled(event) else 0)
-        if len(pl) != exp:
-            if verbose:
-                print(f"[udp] drop len={len(pl)} expected={exp}")
-            continue
-
-        # Optional E2E unwrap + counter check
+        # Optional E2E check
         if _e2e_enabled(event):
-            try:
-                pl_core, counter = e2e_unwrap(pl)
-            except Exception as e:
+            payload_core, counter = e2e_unwrap(payload)
+            if counter != hdr.session_id:
                 if verbose:
-                    print(f"[udp] drop e2e: {e}")
-                continue
-            if counter != hdr.seq:
-                if verbose:
-                    print(f"[udp] drop counter({counter}) != seq({hdr.seq})")
+                    print(f"[udp] drop e2e counter({counter}) != session_id({hdr.session_id})")
                 continue
         else:
-            pl_core = pl
+            payload_core = payload
 
-        vals = decode(sigs, pl_core)
-        print(f"[udp] rx from={addr} id={msg_id} seq={hdr.seq} values={vals}")
+        vals = decode(sigs, payload_core)
+        print(
+            f"[udp] rx someip sid=0x{hdr.service_id:04X} mid=0x{hdr.method_id:04X} "
+            f"sess={hdr.session_id} values={vals}"
+        )
         got += 1
 
     s.close()
@@ -293,6 +282,7 @@ def main() -> int:
     if args.sub_event:
         event = _find_event(cat, args.sub_event)
         _udp_subscribe(
+            cat=cat,
             event=event,
             sig_index=sig_index,
             bind_ip=args.udp_bind_ip,

@@ -47,6 +47,7 @@ class MessageDef:
     udp: Optional[Dict[str, Any]] = None
     tcp: Optional[Dict[str, Any]] = None
     someip: Optional[Dict[str, Any]] = None
+    someip_method_id: Optional[int] = None
 
     e2e: Optional[Dict[str, Any]] = None
 
@@ -58,6 +59,7 @@ class Catalog:
     signals: List[SignalDef]
     services: List[ServiceDef]
     messages: List[MessageDef]
+    someip: Optional[Dict[str, Any]] = None
 
     def signals_by_name(self) -> Dict[str, SignalDef]:
         return {s.name: s for s in self.signals}
@@ -180,12 +182,17 @@ def load_catalog(path: str | Path) -> Catalog:
             udp=m.get("udp"),
             tcp=m.get("tcp"),
             someip=m.get("someip"),
+            someip_method_id=(
+                _as_int(m["someip_method_id"], f"{m.get('name','message')}.someip_method_id")
+                if "someip_method_id" in m
+                else None
+            ),
             signals=[str(x) for x in m.get("signals", [])],
             e2e=m.get("e2e"),
         )
         for m in raw.get("messages", [])
     ]
 
-    cat = Catalog(version=version, signals=signals, services=services, messages=messages)
+    cat = Catalog(version=version, signals=signals, services=services, messages=messages, someip=raw.get("someip"))
     cat.validate()
     return cat

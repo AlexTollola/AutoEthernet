@@ -5,14 +5,14 @@ import socket
 from typing import Dict, Optional
 
 from autoeth.core.config import Catalog, MessageDef, load_catalog
-from autoeth.core.serialization.codec import decode, encode, encoded_size
+from autoeth.core.serialization.codec import decode, encode
 from autoeth.core.serialization.index import SignalIndex
-from autoeth.core.transport.tcp import recv_frame, send_frame
 from autoeth.core.transport.udp import join_multicast
-from autoeth.core.validation.frame import PROTO_VER, pack_header, unpack_header
 from autoeth.core.validation.e2e import unwrap as e2e_unwrap, wrap as e2e_wrap
 from autoeth.core.service.discovery import SdAnnounce, parse_sd_datagram
-from autoeth.protocols.someip.header import MT_NOTIFICATION, parse_message
+from autoeth.protocols.someip.header import MT_NOTIFICATION, parse_message, build_message, MT_REQUEST, MT_RESPONSE
+from autoeth.protocols.someip.stream import recv_someip, send_someip
+
 
 
 def _find_method(cat, name: str) -> MessageDef:
@@ -34,6 +34,7 @@ def _e2e_enabled(msg: MessageDef) -> bool:
 
 def _tcp_call(
     *,
+    cat: Catalog,
     method: MessageDef,
     sig_index: SignalIndex,
     tcp_ip: str,
@@ -54,13 +55,31 @@ def _tcp_call(
         raise SystemExit(f"{method.name}: missing tcp.port")
     to_ms = int(tcp_cfg.get("timeout_ms", timeout_ms))
 
+    svc = cat.someip or {}
+    svc_id = int(svc.get("service_id", 0))
+    iface_ver = int(svc.get("iface_ver", 1))
+
+    method_id = int(method.someip_method_id or 0)
+    if method_id == 0:
+        raise SystemExit(f"{method.name}: missing someip_method_id in catalog")
+
+    CLIENT_ID = 0x0001
+    session_id = 1
+
     sigs = sig_index.subset(method.signals)
     payload = encode(sigs, values)
-    seq = 1
     if _e2e_enabled(method):
-        payload = e2e_wrap(payload, counter=seq)
+        payload = e2e_wrap(payload, counter=session_id)
 
-    frame = bytes([method.msg_id]) + pack_header(seq=seq) + payload
+    req = build_message(
+        service_id=svc_id,
+        method_id=method_id,
+        client_id=CLIENT_ID,
+        session_id=session_id,
+        iface_ver=iface_ver,
+        msg_type=MT_REQUEST,
+        payload=payload,
+    )
 
     if verbose:
         print(f"[tcp] connect {tcp_ip}:{port} method={method.name} id={method.msg_id} values={values}")
@@ -68,38 +87,26 @@ def _tcp_call(
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(max(to_ms, 1) / 1000.0)
     sock.connect((tcp_ip, port))
-    send_frame(sock, frame)
-    rsp = recv_frame(sock)
+    send_someip(sock, req)
+    hdr, pl = recv_someip(sock, max_payload=4096)
     sock.close()
 
-    if not rsp:
-        raise SystemExit("TCP: empty response")
-
-    rsp_id = rsp[0]
-    if rsp_id != method.msg_id:
-        raise SystemExit(f"TCP: response msg_id mismatch (got {rsp_id}, expected {method.msg_id})")
-
-    hdr, pl = unpack_header(rsp[1:])
-    if hdr.proto_ver != PROTO_VER:
-        raise SystemExit(f"TCP: proto_ver mismatch {hdr.proto_ver}")
-    if hdr.seq != seq:
-        raise SystemExit(f"TCP: seq mismatch {hdr.seq} != {seq}")
-
-    exp = encoded_size(sigs) + (4 if _e2e_enabled(method) else 0)
-    if len(pl) != exp:
-        raise SystemExit(f"TCP: payload len mismatch {len(pl)} != {exp}")
+    if hdr.msg_type != MT_RESPONSE:
+        raise SystemExit(f"TCP: expected RESPONSE got 0x{hdr.msg_type:02X}")
 
     if _e2e_enabled(method):
         pl_core, counter = e2e_unwrap(pl)
-        if counter != hdr.seq:
-            raise SystemExit(f"TCP: counter({counter}) != seq({hdr.seq})")
+        if counter != hdr.session_id:
+            raise SystemExit("TCP: E2E counter mismatch")
     else:
         pl_core = pl
 
     vals = decode(sigs, pl_core)
 
-    if verbose:
-        print(f"[tcp] rsp id={rsp_id} values={vals}")
+    print(
+        f"[tcp] rsp sid=0x{hdr.service_id:04X} mid=0x{hdr.method_id:04X} "
+        f"sess={hdr.session_id} values={vals}"
+    )
     return vals
 
 
@@ -269,6 +276,7 @@ def main() -> int:
                 values[n] = float(sig_index.by_name[n].default)
 
         _tcp_call(
+            cat=cat,
             method=method,
             sig_index=sig_index,
             tcp_ip=args.tcp_ip,

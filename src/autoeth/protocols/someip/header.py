@@ -5,6 +5,7 @@ import struct
 from typing import Tuple
 
 _HDR = struct.Struct("!HHIHHBBBB")
+HDR_SIZE = _HDR.size
 
 # Message types (subset)
 MT_REQUEST = 0x00
@@ -82,14 +83,15 @@ def build_message(
 
 def parse_message(data: bytes) -> Tuple[SomeIpHeader, bytes]:
     hdr = SomeIpHeader.unpack(data)
-    payload = data[_HDR.size:]
 
-    expected = hdr.length - 8
+    expected = hdr.length - 8  # SOME/IP rule
     if expected < 0:
         raise ValueError("SOME/IP invalid length")
-    if len(payload) < expected:
+    if len(data) < HDR_SIZE + expected:
         raise ValueError("SOME/IP truncated payload")
-    payload = payload[:expected]
+
+    payload = data[HDR_SIZE:HDR_SIZE + expected]
     return hdr, payload
+
 
 

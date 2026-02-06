@@ -10,12 +10,13 @@ from typing import Dict, List, Tuple
 from autoeth.core.config import Catalog, MessageDef, SignalDef, load_catalog
 from autoeth.core.serialization.codec import decode, encode, encoded_size
 from autoeth.core.serialization.index import SignalIndex
-from autoeth.core.transport.tcp import TcpServer, recv_frame, send_frame
+from autoeth.core.transport.tcp import TcpServer
 from autoeth.core.transport import udp as udp_transport
-from autoeth.core.validation.frame import PROTO_VER, pack_header, unpack_header, header_size
 from autoeth.core.validation.e2e import unwrap as e2e_unwrap, wrap as e2e_wrap
 from autoeth.core.service.discovery import SdAnnounce, build_sd_datagram
-from autoeth.protocols.someip.header import build_message, MT_NOTIFICATION
+from autoeth.protocols.someip.header import build_message, MT_NOTIFICATION, MT_REQUEST, MT_RESPONSE, RC_OK
+from autoeth.protocols.someip.stream import recv_someip, send_someip
+
 
 
 
@@ -38,7 +39,8 @@ def _tcp_handler(
     conn: socket.socket,
     addr: tuple,
     *,
-    method_by_id: Dict[int, MessageDef],
+    cat: Catalog,
+    method: MessageDef,
     sig_index: SignalIndex,
     state: Dict[str, float],
     state_lock: threading.Lock,
@@ -47,61 +49,50 @@ def _tcp_handler(
     if verbose:
         print(f"[tcp] client connected: {addr}")
 
+    svc = cat.someip or {}
+    svc_id = int(svc.get("service_id", 0))
+    iface_ver = int(svc.get("iface_ver", 1))
+
+    method_id = int(method.someip_method_id or 0)
+    if method_id == 0:
+        raise RuntimeError(f"{method.name}: missing someip_method_id in catalog")
+
+    sigs = sig_index.subset(method.signals)
+
     while True:
-        frame = recv_frame(conn)
-        if not frame:
-            break
-
-        if len(frame) < 1:
-            if verbose:
-                print("[tcp] rx invalid frame (too short)")
-            continue
-
-        msg_id = frame[0]
-        payload = frame[1:]
-
-        msg = method_by_id.get(msg_id)
-        if msg is None:
-            if verbose:
-                print(f"[tcp] rx unknown msg_id={msg_id} (ignored)")
-            continue
-
-        sigs = sig_index.subset(msg.signals)
-
         try:
-            hdr, pl = unpack_header(payload)
-            if hdr.proto_ver != PROTO_VER:
-                if verbose:
-                    print(f"[tcp] drop {msg.name}: proto_ver={hdr.proto_ver} != {PROTO_VER}")
-                continue
-
-            exp = encoded_size(sigs) + (4 if _e2e_enabled(msg) else 0)
-            if len(pl) != exp:
-                if verbose:
-                    print(f"[tcp] drop {msg.name}: payload_len={len(pl)} expected={exp}")
-                continue
-
-            if _e2e_enabled(msg):
-                try:
-                    pl_core, counter = e2e_unwrap(pl)
-                except Exception as e:
-                    if verbose:
-                        print(f"[tcp] drop {msg.name}: {e}")
-                    continue
-                if counter != hdr.seq:
-                    if verbose:
-                        print(f"[tcp] drop {msg.name}: counter({counter}) != seq({hdr.seq})")
-                    continue
-            else:
-                pl_core = pl
-
-            values = decode(sigs, pl_core)
-
-
+            hdr, pl = recv_someip(conn, max_payload=4096)
+        except ConnectionError:
+            break
         except Exception as e:
             if verbose:
-                print(f"[tcp] decode error msg={msg.name} id={msg_id}: {e}")
+                print(f"[tcp] recv error: {e}")
             continue
+
+        if hdr.service_id != svc_id or hdr.method_id != method_id or hdr.msg_type != MT_REQUEST:
+            if verbose:
+                print(
+                    f"[tcp] drop someip sid=0x{hdr.service_id:04X} mid=0x{hdr.method_id:04X} "
+                    f"type=0x{hdr.msg_type:02X}"
+                )
+            continue
+
+        # Optional E2E (counter = session_id)
+        if _e2e_enabled(method):
+            try:
+                pl_core, counter = e2e_unwrap(pl)
+            except Exception as e:
+                if verbose:
+                    print(f"[tcp] drop e2e: {e}")
+                continue
+            if counter != hdr.session_id:
+                if verbose:
+                    print(f"[tcp] drop e2e counter({counter}) != session_id({hdr.session_id})")
+                continue
+        else:
+            pl_core = pl
+
+        values = decode(sigs, pl_core)
 
         # Update shared state
         with state_lock:
@@ -109,14 +100,23 @@ def _tcp_handler(
                 state[k] = float(v)
 
         if verbose:
-            print(f"[tcp] rx method {msg.name} id={msg_id} values={values}")
+            print(f"[tcp] rx {method.name} sess={hdr.session_id} values={values}")
 
         rsp_pl = encode(sigs, values)
-        if _e2e_enabled(msg):
-            rsp_pl = e2e_wrap(rsp_pl, counter=hdr.seq)
+        if _e2e_enabled(method):
+            rsp_pl = e2e_wrap(rsp_pl, counter=hdr.session_id)
 
-        rsp = bytes([msg_id]) + pack_header(seq=hdr.seq) + rsp_pl
-        send_frame(conn, rsp)
+        rsp = build_message(
+            service_id=svc_id,
+            method_id=method_id,
+            client_id=hdr.client_id,
+            session_id=hdr.session_id,
+            iface_ver=iface_ver,
+            msg_type=MT_RESPONSE,
+            payload=rsp_pl,
+            return_code=RC_OK,
+        )
+        send_someip(conn, rsp)
 
     if verbose:
         print(f"[tcp] client disconnected: {addr}")
@@ -309,7 +309,8 @@ def main() -> int:
         _tcp_handler(
             conn,
             addr,
-            method_by_id=method_by_id,
+            cat=cat,
+            method=first_method,
             sig_index=sig_index,
             state=state,
             state_lock=state_lock,

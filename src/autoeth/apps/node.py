@@ -7,7 +7,7 @@ import threading
 import time
 from typing import Dict, List, Tuple
 
-from autoeth.core.config import Catalog, MessageDef, SignalDef, load_catalog
+from autoeth.core.config import Catalog, MessageDef, SignalDef, load_catalog, resolve_someip
 from autoeth.core.serialization.codec import decode, encode, encoded_size
 from autoeth.core.serialization.index import SignalIndex
 from autoeth.core.transport.tcp import TcpServer
@@ -49,13 +49,7 @@ def _tcp_handler(
     if verbose:
         print(f"[tcp] client connected: {addr}")
 
-    svc = cat.someip or {}
-    svc_id = int(svc.get("service_id", 0))
-    iface_ver = int(svc.get("iface_ver", 1))
-
-    method_id = int(method.someip_method_id or 0)
-    if method_id == 0:
-        raise RuntimeError(f"{method.name}: missing someip_method_id in catalog")
+    svc_id, iface_ver, method_id = resolve_someip(cat, method)
 
     sigs = sig_index.subset(method.signals)
 
@@ -159,6 +153,7 @@ class UdpEventPublisher(threading.Thread):
 
         self.seq = 0
         self.exp_len = encoded_size(self.sigs)
+        self.svc_id, self.iface_ver, self.someip_id = resolve_someip(cat, msg)
 
 
     def run(self) -> None:
@@ -177,13 +172,7 @@ class UdpEventPublisher(threading.Thread):
             with self.state_lock:
                 vals = {s.name: float(self.state.get(s.name, s.default)) for s in self.sigs}
 
-            svc = (self.cat.someip or {})
-            svc_id = int(svc.get("service_id", 0))
-            iface_ver = int(svc.get("iface_ver", 1))
-
-            method_id = int(self.msg.someip_method_id or 0)
-            if method_id == 0:
-                raise RuntimeError(f"{self.msg.name}: missing someip_method_id in catalog")
+            svc_id, iface_ver, method_id = self.svc_id, self.iface_ver, self.someip_id
 
             self.seq = (self.seq + 1) & 0xFFFF
 
@@ -330,13 +319,13 @@ def main() -> int:
     udp_mode = 1 if str(udp_cfg.get("mode", "unicast")) == "multicast" else 0
     mcast_group = str(udp_cfg.get("mcast_group", "0.0.0.0")) if udp_mode == 1 else "0.0.0.0"
 
-    # Service IDs (first service in catalog)
-    svc_id = 0
-    inst_id = 0
-    if getattr(cat, "services", None):
-        s0 = cat.services[0]
-        svc_id = int(getattr(s0, "service_id", 0))
-        inst_id = int(getattr(s0, "instance_id", 0))
+    # Service IDs (service referenced by catalog messages)
+    primary_svc_name = (first_method.someip or {}).get("service") or (first_event.someip or {}).get("service")
+    if not primary_svc_name:
+        raise SystemExit("No someip.service found to announce in SD")
+    svc = cat.services_by_name()[str(primary_svc_name)]
+    svc_id = int(svc.service_id)
+    inst_id = int(svc.instance_id)
 
     # Flags: bit0=event E2E enabled, bit1=method E2E enabled
     event_e2e = 1 if _e2e_enabled(first_event) else 0

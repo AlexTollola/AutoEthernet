@@ -47,7 +47,6 @@ class MessageDef:
     udp: Optional[Dict[str, Any]] = None
     tcp: Optional[Dict[str, Any]] = None
     someip: Optional[Dict[str, Any]] = None
-    someip_method_id: Optional[int] = None
 
     e2e: Optional[Dict[str, Any]] = None
 
@@ -59,7 +58,6 @@ class Catalog:
     signals: List[SignalDef]
     services: List[ServiceDef]
     messages: List[MessageDef]
-    someip: Optional[Dict[str, Any]] = None
 
     def signals_by_name(self) -> Dict[str, SignalDef]:
         return {s.name: s for s in self.signals}
@@ -69,6 +67,9 @@ class Catalog:
 
     def messages_by_id(self) -> Dict[int, MessageDef]:
         return {m.msg_id: m for m in self.messages}
+
+    def services_by_name(self) -> Dict[str, ServiceDef]:
+        return {s.name: s for s in self.services}
 
     def validate(self) -> None:
         # signals unique
@@ -141,6 +142,21 @@ class Catalog:
         svc_names = [s.name for s in self.services]
         if len(svc_names) != len(set(svc_names)):
             raise ValueError("services: duplicate names")
+        svc_set: Set[str] = set(svc_names)
+
+        # SOME/IP mapping checks (service-driven)
+        for m in self.messages:
+            if not m.someip:
+                raise ValueError(f"{m.name}: someip block missing")
+            svc_name = str(m.someip.get("service", "")).strip()
+            if not svc_name:
+                raise ValueError(f"{m.name}.someip.service missing")
+            if svc_name not in svc_set:
+                raise ValueError(f"{m.name}.someip.service unknown: {svc_name}")
+            if m.kind == "event" and "event_id" not in m.someip:
+                raise ValueError(f"{m.name}.someip.event_id missing")
+            if m.kind == "method" and "method_id" not in m.someip:
+                raise ValueError(f"{m.name}.someip.method_id missing")
 
 
 def load_catalog(path: str | Path) -> Catalog:
@@ -181,18 +197,49 @@ def load_catalog(path: str | Path) -> Catalog:
             period_ms=int(m["period_ms"]) if "period_ms" in m else None,
             udp=m.get("udp"),
             tcp=m.get("tcp"),
-            someip=m.get("someip"),
-            someip_method_id=(
-                _as_int(m["someip_method_id"], f"{m.get('name','message')}.someip_method_id")
-                if "someip_method_id" in m
-                else None
-            ),
+            someip=_normalize_someip(m, name=str(m.get("name", "message"))),
             signals=[str(x) for x in m.get("signals", [])],
             e2e=m.get("e2e"),
         )
         for m in raw.get("messages", [])
     ]
 
-    cat = Catalog(version=version, signals=signals, services=services, messages=messages, someip=raw.get("someip"))
+    cat = Catalog(version=version, signals=signals, services=services, messages=messages)
     cat.validate()
     return cat
+
+
+def _normalize_someip(m_raw: Dict[str, Any], name: str) -> Optional[Dict[str, Any]]:
+    s = m_raw.get("someip")
+    if s is None:
+        return None
+    if not isinstance(s, dict):
+        raise TypeError(f"{name}.someip: expected dict")
+    out = dict(s)
+    if "service" in out:
+        out["service"] = str(out["service"])
+    if "event_id" in out:
+        out["event_id"] = _as_int(out["event_id"], f"{name}.someip.event_id")
+    if "method_id" in out:
+        out["method_id"] = _as_int(out["method_id"], f"{name}.someip.method_id")
+    return out
+
+
+def resolve_someip(cat: Catalog, msg: MessageDef) -> tuple[int, int, int]:
+    """
+    Returns: (service_id, iface_ver, id16) where id16 is method_id or event_id.
+    """
+    if not msg.someip:
+        raise ValueError(f"{msg.name}: someip missing")
+    svc_name = str(msg.someip.get("service", "")).strip()
+    svc = cat.services_by_name().get(svc_name)
+    if not svc:
+        raise ValueError(f"{msg.name}: unknown someip.service {svc_name!r}")
+    iface_ver = int(svc.interface_version)
+    if msg.kind == "event":
+        someip_id = int(msg.someip["event_id"])
+    elif msg.kind == "method":
+        someip_id = int(msg.someip["method_id"])
+    else:
+        raise ValueError(f"{msg.name}: invalid kind {msg.kind!r}")
+    return int(svc.service_id), iface_ver, someip_id

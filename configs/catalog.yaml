@@ -63,8 +63,6 @@ services:
 # tcp.timeout_ms: TCP request timeout in ms
 # someip.service: Service name reference from services[]
 # someip.event_id: SOME/IP event ID (hex allowed)
-# someip.method_id: SOME/IP method ID (hex allowed)
-# someip_method_id: SOME/IP method ID (hex allowed) for tools that map events/methods uniformly
 # signals: Signal list encoded in payload
 # e2e.enabled: Enable end-to-end protection
 # e2e.crc16: CRC algorithm name
@@ -84,28 +82,16 @@ messages:
     someip:
       service: demo_service
       event_id: 0x0100
-    someip_method_id: 0x1001
-    signals:
-      - vehicle_speed_kph
-      - engine_rpm
-      - steering_angle_deg
-    e2e:
-      enabled: true
-      crc16: ccitt-false
+    signals: [vehicle_speed_kph, engine_rpm, steering_angle_deg]
+    e2e: { enabled: true, crc16: ccitt-false }
 
   - name: control_method
     msg_id: 2
     kind: method
     transport: tcp
-    tcp:
-      port: 30510
-      timeout_ms: 200
+    tcp: { port: 30510, timeout_ms: 200 }
     someip:
       service: demo_service
       method_id: 0x0200
-    someip_method_id: 0x1002
-    signals:
-      - steering_angle_deg
-    e2e:
-      enabled: true
-      crc16: ccitt-false
+    signals: [steering_angle_deg]
+    e2e: { enabled: true, crc16: ccitt-false }

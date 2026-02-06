@@ -4,7 +4,7 @@ import argparse
 import socket
 from typing import Dict, Optional
 
-from autoeth.core.config import Catalog, MessageDef, load_catalog
+from autoeth.core.config import Catalog, MessageDef, load_catalog, resolve_someip
 from autoeth.core.serialization.codec import decode, encode
 from autoeth.core.serialization.index import SignalIndex
 from autoeth.core.transport.udp import join_multicast
@@ -55,13 +55,7 @@ def _tcp_call(
         raise SystemExit(f"{method.name}: missing tcp.port")
     to_ms = int(tcp_cfg.get("timeout_ms", timeout_ms))
 
-    svc = cat.someip or {}
-    svc_id = int(svc.get("service_id", 0))
-    iface_ver = int(svc.get("iface_ver", 1))
-
-    method_id = int(method.someip_method_id or 0)
-    if method_id == 0:
-        raise SystemExit(f"{method.name}: missing someip_method_id in catalog")
+    svc_id, iface_ver, method_id = resolve_someip(cat, method)
 
     CLIENT_ID = 0x0001
     session_id = 1
@@ -155,9 +149,7 @@ def _udp_subscribe(
             print("[udp] timeout waiting for datagram")
             continue
 
-        svc = (cat.someip or {})
-        svc_id = int(svc.get("service_id", 0))
-        method_id = int(event.someip_method_id or 0)
+        svc_id, _iface_ver, method_id = resolve_someip(cat, event)
 
         hdr, payload = parse_message(data)
 

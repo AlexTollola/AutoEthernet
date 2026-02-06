@@ -117,11 +117,26 @@ class Catalog:
                     raise ValueError(f"{m.name}: udp block missing")
                 if "port" not in m.udp:
                     raise ValueError(f"{m.name}.udp.port missing")
+                try:
+                    port = int(m.udp.get("port", 0))
+                except (TypeError, ValueError):
+                    raise ValueError(f"{m.name}.udp.port invalid")
+                if port <= 0:
+                    raise ValueError(f"{m.name}.udp.port invalid")
+                mode = str(m.udp.get("mode", "unicast"))
+                if mode == "multicast" and not m.udp.get("mcast_group"):
+                    raise ValueError(f"{m.name}.udp.mcast_group missing for multicast")
             if m.transport == "tcp":
                 if not m.tcp:
                     raise ValueError(f"{m.name}: tcp block missing")
                 if "port" not in m.tcp:
                     raise ValueError(f"{m.name}.tcp.port missing")
+                try:
+                    port = int(m.tcp.get("port", 0))
+                except (TypeError, ValueError):
+                    raise ValueError(f"{m.name}.tcp.port invalid")
+                if port <= 0:
+                    raise ValueError(f"{m.name}.tcp.port invalid")
 
             if m.kind == "event":
                 if m.transport == "tcp":

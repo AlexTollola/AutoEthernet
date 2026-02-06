@@ -9,7 +9,7 @@ from autoeth.core.serialization.codec import decode, encode
 from autoeth.core.serialization.index import SignalIndex
 from autoeth.core.transport.udp import join_multicast
 from autoeth.core.validation.e2e import unwrap as e2e_unwrap, wrap as e2e_wrap
-from autoeth.core.service.discovery import SdAnnounce, parse_sd_datagram
+from autoeth.core.service.discovery import SdAnnounce, SdEvent, SdService, parse_sd_datagram
 from autoeth.protocols.someip.header import MT_NOTIFICATION, parse_message, build_message, MT_REQUEST, MT_RESPONSE
 from autoeth.protocols.someip.stream import recv_someip, send_someip
 
@@ -30,6 +30,34 @@ def _find_event(cat, name: str) -> MessageDef:
 
 def _e2e_enabled(msg: MessageDef) -> bool:
     return bool((msg.e2e or {}).get("enabled", False))
+
+
+def _find_sd_service(ann: SdAnnounce, svc_id: int) -> SdService | None:
+    for svc in ann.services:
+        if svc.service_id == svc_id:
+            return svc
+    return None
+
+
+def _find_sd_event(svc: SdService, event_id: int) -> SdEvent | None:
+    for ev in svc.events:
+        if ev.event_id == event_id:
+            return ev
+    return None
+
+
+def _print_sd_summary(ann: SdAnnounce) -> None:
+    for svc in ann.services:
+        print(
+            f"[sd] service sid=0x{svc.service_id:04X} inst=0x{svc.instance_id:04X} "
+            f"iface_ver={svc.iface_ver} tcp_ports={list(svc.tcp_ports)}"
+        )
+        for ev in svc.events:
+            mode = "multicast" if ev.udp_mode == 1 else "unicast"
+            print(
+                f"[sd] event id=0x{ev.event_id:04X} udp_port={ev.udp_port} "
+                f"mode={mode} group={ev.mcast_group} ttl={ev.ttl}"
+            )
 
 
 def _tcp_call(
@@ -114,14 +142,19 @@ def _udp_subscribe(
     count: int,
     timeout_s: float,
     verbose: bool,
+    discover_event: SdEvent | None = None,
 ) -> None:
     udp_cfg = event.udp or {}
-    port = int(udp_cfg.get("port", 0))
+    if discover_event is not None:
+        port = int(discover_event.udp_port)
+        mode = "multicast" if discover_event.udp_mode == 1 else "unicast"
+        group = discover_event.mcast_group if mode == "multicast" else ""
+    else:
+        port = int(udp_cfg.get("port", 0))
+        mode = str(udp_cfg.get("mode", "unicast"))
+        group = str(udp_cfg.get("mcast_group", ""))
     if not port:
         raise SystemExit(f"{event.name}: missing udp.port")
-
-    mode = str(udp_cfg.get("mode", "unicast"))
-    group = str(udp_cfg.get("mcast_group", ""))
 
     sigs = sig_index.subset(event.signals)
 
@@ -201,7 +234,7 @@ def _discover(*, group: str, port: int, bind_ip: str, iface_ip: str, timeout_s: 
             print(f"[sd] rx from={addr} seq={seq} ann={ann}")
         s.close()
         # Use source IP as the server IP (most reliable)
-        return addr[0], int(ann.tcp_port), ann
+        return addr[0], ann
 
 
 def main() -> int:
@@ -234,9 +267,9 @@ def main() -> int:
 
     sig_index = SignalIndex.from_signals(cat.signals)
 
-    discovered = None
+    discovered: tuple[str, SdAnnounce] | None = None
     if args.discover:
-        tcp_ip, tcp_port_disc, ann = _discover(
+        tcp_ip, ann = _discover(
             group=args.sd_group,
             port=args.sd_port,
             bind_ip="0.0.0.0",
@@ -244,17 +277,25 @@ def main() -> int:
             timeout_s=args.sd_timeout_s,
             verbose=args.verbose,
         )
-        discovered = (tcp_ip, tcp_port_disc, ann)
+        discovered = (tcp_ip, ann)
+        _print_sd_summary(ann)
 
         # If user didn't explicitly set tcp-ip/port, override.
         if args.tcp_ip == "127.0.0.1":
             args.tcp_ip = tcp_ip
-        if args.tcp_port is None:
-            args.tcp_port = tcp_port_disc
 
     # TCP call
     if args.call_method:
         method = _find_method(cat, args.call_method)
+        if discovered and args.tcp_port is None:
+            svc_id, _iface_ver, _method_id = resolve_someip(cat, method)
+            svc = _find_sd_service(discovered[1], svc_id)
+            if svc and svc.tcp_ports:
+                if len(svc.tcp_ports) != 1:
+                    raise SystemExit(
+                        f"Discovery has multiple TCP ports for sid=0x{svc_id:04X}: {list(svc.tcp_ports)}"
+                    )
+                args.tcp_port = int(svc.tcp_ports[0])
         values: Dict[str, float] = {}
         for item in args.set:
             if "=" not in item:
@@ -281,6 +322,12 @@ def main() -> int:
     # UDP subscribe
     if args.sub_event:
         event = _find_event(cat, args.sub_event)
+        disc_event = None
+        if discovered:
+            svc_id, _iface_ver, event_id = resolve_someip(cat, event)
+            svc = _find_sd_service(discovered[1], svc_id)
+            if svc:
+                disc_event = _find_sd_event(svc, event_id)
         _udp_subscribe(
             cat=cat,
             event=event,
@@ -290,6 +337,7 @@ def main() -> int:
             count=args.count,
             timeout_s=args.udp_timeout_s,
             verbose=args.verbose,
+            discover_event=disc_event,
         )
 
     if not args.call_method and not args.sub_event:

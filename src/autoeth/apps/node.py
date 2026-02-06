@@ -13,16 +13,12 @@ from autoeth.core.serialization.index import SignalIndex
 from autoeth.core.transport.tcp import TcpServer
 from autoeth.core.transport import udp as udp_transport
 from autoeth.core.validation.e2e import unwrap as e2e_unwrap, wrap as e2e_wrap
-from autoeth.core.service.discovery import SdAnnounce, build_sd_datagram
+from autoeth.core.service.discovery import SdAnnounce, SdEvent, SdService, build_sd_datagram
 from autoeth.protocols.someip.header import build_message, MT_NOTIFICATION, MT_REQUEST, MT_RESPONSE, MT_ERROR, RC_OK, RC_NOT_OK
 from autoeth.protocols.someip.stream import recv_someip, send_someip
 
 
 
-
-
-def _udp_events(cat: Catalog) -> List[MessageDef]:
-    return [m for m in cat.messages if m.kind == "event" and m.transport == "udp"]
 
 
 def _init_state(signals: List[SignalDef]) -> Dict[str, float]:
@@ -38,11 +34,22 @@ class MethodRoute(NamedTuple):
     sigs: list[SignalDef]
 
 
+class EventRoute(NamedTuple):
+    msg: MessageDef
+    iface_ver: int
+    sigs: list[SignalDef]
+    svc_id: int
+    event_id: int
+
+
 def _build_tcp_routes(cat: Catalog, sig_index: SignalIndex) -> dict[tuple[int, int], MethodRoute]:
     routes: dict[tuple[int, int], MethodRoute] = {}
 
     for m in cat.messages:
         if m.kind == "method" and m.transport == "tcp":
+            tcp = m.tcp or {}
+            if int(tcp.get("port", 0)) == 0:
+                raise SystemExit(f"{m.name}: tcp.port missing/0")
             svc_id, iface_ver, method_id = resolve_someip(cat, m)
             key = (svc_id, method_id)
 
@@ -62,6 +69,102 @@ def _build_tcp_routes(cat: Catalog, sig_index: SignalIndex) -> dict[tuple[int, i
         raise SystemExit("No TCP methods found in catalog (kind=method, transport=tcp).")
 
     return routes
+
+
+def _build_udp_events(cat: Catalog, sig_index: SignalIndex) -> dict[str, EventRoute]:
+    out: dict[str, EventRoute] = {}
+    used: set[tuple[int, int]] = set()
+
+    for m in cat.messages:
+        if m.kind == "event" and m.transport == "udp":
+            svc_id, iface_ver, eid = resolve_someip(cat, m)
+            key = (svc_id, eid)
+            if key in used:
+                raise SystemExit(f"Duplicate UDP event sid=0x{svc_id:04X} eid=0x{eid:04X}")
+            used.add(key)
+
+            udp = m.udp or {}
+            if int(udp.get("port", 0)) == 0:
+                raise SystemExit(f"{m.name}: udp.port missing/0")
+            mode = str(udp.get("mode", "unicast"))
+            if mode == "multicast" and not udp.get("mcast_group"):
+                raise SystemExit(f"{m.name}: udp.mcast_group required for multicast")
+
+            out[m.name] = EventRoute(
+                msg=m,
+                iface_ver=iface_ver,
+                sigs=sig_index.subset(m.signals),
+                svc_id=svc_id,
+                event_id=eid,
+            )
+
+    if not out:
+        raise SystemExit("No UDP events found (kind=event, transport=udp).")
+
+    return out
+
+
+def _build_sd_announce(
+    *,
+    cat: Catalog,
+    routes: dict[tuple[int, int], MethodRoute],
+    udp_events: dict[str, EventRoute],
+) -> SdAnnounce:
+    services_by_name = cat.services_by_name()
+    used_names: set[str] = set()
+
+    for m in cat.messages:
+        svc_name = str((m.someip or {}).get("service", "")).strip()
+        if svc_name:
+            used_names.add(svc_name)
+
+    if not used_names:
+        raise SystemExit("No someip.service entries found for discovery announce")
+
+    services: list[SdService] = []
+    for svc_name in sorted(used_names):
+        svc = services_by_name.get(svc_name)
+        if not svc:
+            raise SystemExit(f"Discovery: unknown service {svc_name!r}")
+
+        tcp_ports = sorted(
+            {
+                int((r.msg.tcp or {}).get("port", 0))
+                for r in routes.values()
+                if str((r.msg.someip or {}).get("service", "")).strip() == svc_name
+            }
+        )
+        tcp_ports = [p for p in tcp_ports if p]
+
+        events: list[SdEvent] = []
+        for route in udp_events.values():
+            if str((route.msg.someip or {}).get("service", "")).strip() != svc_name:
+                continue
+            udp = route.msg.udp or {}
+            mode = str(udp.get("mode", "unicast"))
+            udp_mode = 1 if mode == "multicast" else 0
+            group = str(udp.get("mcast_group", "0.0.0.0")) if udp_mode == 1 else "0.0.0.0"
+            events.append(
+                SdEvent(
+                    event_id=int(route.event_id),
+                    udp_port=int(udp.get("port", 0)),
+                    mcast_group=group,
+                    udp_mode=udp_mode,
+                    ttl=int(udp.get("ttl", 1)),
+                )
+            )
+
+        services.append(
+            SdService(
+                service_id=int(svc.service_id),
+                instance_id=int(svc.instance_id),
+                iface_ver=int(svc.interface_version),
+                tcp_ports=tuple(tcp_ports),
+                events=tuple(events),
+            )
+        )
+
+    return SdAnnounce(services=tuple(services))
 
 
 def _tcp_handler(
@@ -165,9 +268,7 @@ class UdpEventPublisher(threading.Thread):
     def __init__(
         self,
         *,
-        cat: Catalog,
-        msg: MessageDef,
-        sigs: List[SignalDef],
+        route: EventRoute,
         state: Dict[str, float],
         state_lock: threading.Lock,
         stop_evt: threading.Event,
@@ -175,16 +276,18 @@ class UdpEventPublisher(threading.Thread):
         verbose: bool,
     ):
         super().__init__(daemon=True)
-        self.cat = cat
-        self.msg = msg
-        self.sigs = sigs
+        self.msg = route.msg
+        self.sigs = route.sigs
         self.state = state
         self.state_lock = state_lock
         self.stop_evt = stop_evt
         self.dest_ip = dest_ip
         self.verbose = verbose
+        self.svc_id = route.svc_id
+        self.iface_ver = route.iface_ver
+        self.event_id = route.event_id
 
-        udp_cfg = msg.udp or {}
+        udp_cfg = self.msg.udp or {}
         self.mode = str(udp_cfg.get("mode", "unicast"))
         self.group = udp_cfg.get("mcast_group")
         self.port = int(udp_cfg["port"])
@@ -198,14 +301,17 @@ class UdpEventPublisher(threading.Thread):
 
         self.seq = 0
         self.exp_len = encoded_size(self.sigs)
-        self.svc_id, self.iface_ver, self.someip_id = resolve_someip(cat, msg)
 
 
     def run(self) -> None:
         next_t = time.monotonic()
 
         if self.verbose:
-            print(f"[udp] pub {self.msg.name} id={self.msg.msg_id} -> {self.dest} period_ms={int(self.period_s*1000)}")
+            print(
+                f"[udp] pub {self.msg.name} id={self.msg.msg_id} "
+                f"sid=0x{self.svc_id:04X} eid=0x{self.event_id:04X} -> {self.dest} "
+                f"period_ms={int(self.period_s*1000)}"
+            )
 
         while not self.stop_evt.is_set():
             now = time.monotonic()
@@ -217,7 +323,7 @@ class UdpEventPublisher(threading.Thread):
             with self.state_lock:
                 vals = {s.name: float(self.state.get(s.name, s.default)) for s in self.sigs}
 
-            svc_id, iface_ver, method_id = self.svc_id, self.iface_ver, self.someip_id
+            svc_id, iface_ver, method_id = self.svc_id, self.iface_ver, self.event_id
 
             self.seq = (self.seq + 1) & 0xFFFF
 
@@ -251,13 +357,7 @@ class SdAnnouncer(threading.Thread):
     def __init__(
         self,
         *,
-        service_id: int,
-        instance_id: int,
-        tcp_port: int,
-        event_port: int,
-        udp_mode: int,
-        mcast_group: str,
-        flags: int,
+        ann: SdAnnounce,
         group_ip: str,
         group_port: int,
         iface: str | None,
@@ -266,15 +366,7 @@ class SdAnnouncer(threading.Thread):
         verbose: bool,
     ):
         super().__init__(daemon=True)
-        self.ann = SdAnnounce(
-            service_id=service_id,
-            instance_id=instance_id,
-            tcp_port=tcp_port,
-            event_port=event_port,
-            mcast_group=mcast_group,
-            udp_mode=udp_mode,
-            flags=flags,
-        )
+        self.ann = ann
         self.dest = (group_ip, int(group_port))
         self.stop_evt = stop_evt
         self.verbose = verbose
@@ -341,8 +433,6 @@ def main() -> int:
     else:
         tcp_port = int(args.tcp_port)
 
-    first_method = next(iter(routes.values())).msg
-
     def _handler(conn: socket.socket, addr: tuple) -> None:
         _tcp_handler(
             conn,
@@ -357,43 +447,20 @@ def main() -> int:
     srv = TcpServer(listen_ip=args.listen_ip, port=tcp_port, handler=_handler)
     srv.start()
 
-    # Determine a "primary" UDP event to announce (first UDP event in catalog)
-    udp_msgs = _udp_events(cat)
-    if not udp_msgs:
-        raise SystemExit("No UDP events found in catalog (kind=event, transport=udp).")
-    first_event = udp_msgs[0]
+    # UDP events
+    udp_events = _build_udp_events(cat, sig_index)
+    first_event = next(iter(udp_events.values())).msg
     udp_cfg = first_event.udp or {}
-    event_port = int(udp_cfg.get("port", 0))
-    udp_mode = 1 if str(udp_cfg.get("mode", "unicast")) == "multicast" else 0
-    mcast_group = str(udp_cfg.get("mcast_group", "0.0.0.0")) if udp_mode == 1 else "0.0.0.0"
-
-    # Service IDs (service referenced by catalog messages)
-    primary_svc_name = (first_method.someip or {}).get("service") or (first_event.someip or {}).get("service")
-    if not primary_svc_name:
-        raise SystemExit("No someip.service found to announce in SD")
-    svc = cat.services_by_name()[str(primary_svc_name)]
-    svc_id = int(svc.service_id)
-    inst_id = int(svc.instance_id)
-
-    # Flags: bit0=event E2E enabled, bit1=method E2E enabled
-    event_e2e = 1 if _e2e_enabled(first_event) else 0
-    method_e2e = 1 if _e2e_enabled(first_method) else 0
-    flags = (event_e2e << 0) | (method_e2e << 1)
 
     # SD multicast (use a dedicated group/port)
     sd_group = "239.0.0.2"
     sd_port = 30490
-    sd_iface = str(udp_cfg.get("iface")) if udp_mode == 1 else None
+    sd_iface = str(udp_cfg.get("iface")) if str(udp_cfg.get("mode", "unicast")) == "multicast" else None
     sd_ttl = int(udp_cfg.get("ttl", 1))
 
+    ann = _build_sd_announce(cat=cat, routes=routes, udp_events=udp_events)
     sd = SdAnnouncer(
-        service_id=svc_id,
-        instance_id=inst_id,
-        tcp_port=int(tcp_port),
-        event_port=int(event_port),
-        udp_mode=int(udp_mode),
-        mcast_group=mcast_group,
-        flags=int(flags),
+        ann=ann,
         group_ip=sd_group,
         group_port=sd_port,
         iface=sd_iface,
@@ -405,12 +472,9 @@ def main() -> int:
 
     # UDP publishers (events)
     udp_threads: List[UdpEventPublisher] = []
-    for m in udp_msgs:
-        sigs = sig_index.subset(m.signals)
+    for route in udp_events.values():
         t = UdpEventPublisher(
-            cat=cat,
-            msg=m,
-            sigs=sigs,
+            route=route,
             state=state,
             state_lock=state_lock,
             stop_evt=stop_evt,
@@ -422,7 +486,8 @@ def main() -> int:
 
     print(
         f"[node] tcp_methods={sorted(r.msg.msg_id for r in routes.values())} "
-        f"tcp_listen={args.listen_ip}:{tcp_port} udp_events={[m.msg_id for m in udp_msgs]}"
+        f"tcp_listen={args.listen_ip}:{tcp_port} "
+        f"udp_events={[r.msg.msg_id for r in udp_events.values()]}"
     )
 
     def _sigint(_signum, _frame):

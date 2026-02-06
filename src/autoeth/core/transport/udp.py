@@ -21,9 +21,14 @@ def make_socket(
 
     if iface:
         try:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode("utf-8"))
-        except OSError:
-            pass
+            opt = getattr(socket, "SO_BINDTODEVICE")
+        except AttributeError:
+            opt = None
+        if opt is not None:
+            try:
+                s.setsockopt(socket.SOL_SOCKET, opt, iface.encode("utf-8"))
+            except OSError:
+                pass
 
     s.bind((bind_ip, int(bind_port)))
     return s
@@ -42,4 +47,3 @@ def dest(mode: str, mcast_group: Optional[str], unicast_ip: str, port: int) -> T
             raise ValueError("multicast mode requires mcast_group")
         return (mcast_group, int(port))
     return (unicast_ip, int(port))
-

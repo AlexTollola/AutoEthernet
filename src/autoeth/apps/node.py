@@ -5,7 +5,7 @@ import signal
 import socket
 import threading
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, NamedTuple
 
 from autoeth.core.config import Catalog, MessageDef, SignalDef, load_catalog, resolve_someip
 from autoeth.core.serialization.codec import decode, encode, encoded_size
@@ -14,15 +14,11 @@ from autoeth.core.transport.tcp import TcpServer
 from autoeth.core.transport import udp as udp_transport
 from autoeth.core.validation.e2e import unwrap as e2e_unwrap, wrap as e2e_wrap
 from autoeth.core.service.discovery import SdAnnounce, build_sd_datagram
-from autoeth.protocols.someip.header import build_message, MT_NOTIFICATION, MT_REQUEST, MT_RESPONSE, RC_OK
+from autoeth.protocols.someip.header import build_message, MT_NOTIFICATION, MT_REQUEST, MT_RESPONSE, MT_ERROR, RC_OK, RC_NOT_OK
 from autoeth.protocols.someip.stream import recv_someip, send_someip
 
 
 
-
-
-def _method_by_id(cat: Catalog) -> Dict[int, MessageDef]:
-    return {m.msg_id: m for m in cat.messages if m.kind == "method" and m.transport == "tcp"}
 
 
 def _udp_events(cat: Catalog) -> List[MessageDef]:
@@ -35,23 +31,51 @@ def _init_state(signals: List[SignalDef]) -> Dict[str, float]:
 def _e2e_enabled(msg: MessageDef) -> bool:
     return bool((msg.e2e or {}).get("enabled", False))
 
+
+class MethodRoute(NamedTuple):
+    msg: MessageDef
+    iface_ver: int
+    sigs: list[SignalDef]
+
+
+def _build_tcp_routes(cat: Catalog, sig_index: SignalIndex) -> dict[tuple[int, int], MethodRoute]:
+    routes: dict[tuple[int, int], MethodRoute] = {}
+
+    for m in cat.messages:
+        if m.kind == "method" and m.transport == "tcp":
+            svc_id, iface_ver, method_id = resolve_someip(cat, m)
+            key = (svc_id, method_id)
+
+            if key in routes:
+                raise SystemExit(
+                    f"Duplicate TCP method mapping sid=0x{svc_id:04X} mid=0x{method_id:04X} "
+                    f"({routes[key].msg.name} vs {m.name})"
+                )
+
+            routes[key] = MethodRoute(
+                msg=m,
+                iface_ver=iface_ver,
+                sigs=sig_index.subset(m.signals),
+            )
+
+    if not routes:
+        raise SystemExit("No TCP methods found in catalog (kind=method, transport=tcp).")
+
+    return routes
+
+
 def _tcp_handler(
     conn: socket.socket,
     addr: tuple,
     *,
     cat: Catalog,
-    method: MessageDef,
-    sig_index: SignalIndex,
+    routes: dict[tuple[int, int], MethodRoute],
     state: Dict[str, float],
     state_lock: threading.Lock,
     verbose: bool,
 ) -> None:
     if verbose:
         print(f"[tcp] client connected: {addr}")
-
-    svc_id, iface_ver, method_id = resolve_someip(cat, method)
-
-    sigs = sig_index.subset(method.signals)
 
     while True:
         try:
@@ -63,16 +87,35 @@ def _tcp_handler(
                 print(f"[tcp] recv error: {e}")
             continue
 
-        if hdr.service_id != svc_id or hdr.method_id != method_id or hdr.msg_type != MT_REQUEST:
-            if verbose:
-                print(
-                    f"[tcp] drop someip sid=0x{hdr.service_id:04X} mid=0x{hdr.method_id:04X} "
-                    f"type=0x{hdr.msg_type:02X}"
-                )
+        # Solo aceptamos REQUEST
+        if hdr.msg_type != MT_REQUEST:
             continue
 
-        # Optional E2E (counter = session_id)
-        if _e2e_enabled(method):
+        key = (hdr.service_id, hdr.method_id)
+        route = routes.get(key)
+        if not route:
+            if verbose:
+                print(f"[tcp] unknown method sid=0x{hdr.service_id:04X} mid=0x{hdr.method_id:04X}")
+
+            err = build_message(
+                service_id=hdr.service_id,
+                method_id=hdr.method_id,
+                client_id=hdr.client_id,
+                session_id=hdr.session_id,
+                iface_ver=hdr.iface_ver,
+                msg_type=MT_ERROR,
+                payload=b"",
+                return_code=RC_NOT_OK,
+            )
+            send_someip(conn, err)
+            continue
+
+        msg = route.msg
+        sigs = route.sigs
+        iface_ver = route.iface_ver
+
+        # E2E opcional (counter = session_id)
+        if _e2e_enabled(msg):
             try:
                 pl_core, counter = e2e_unwrap(pl)
             except Exception as e:
@@ -88,21 +131,23 @@ def _tcp_handler(
 
         values = decode(sigs, pl_core)
 
-        # Update shared state
         with state_lock:
             for k, v in values.items():
                 state[k] = float(v)
 
         if verbose:
-            print(f"[tcp] rx {method.name} sess={hdr.session_id} values={values}")
+            print(
+                f"[tcp] rx {msg.name} sid=0x{hdr.service_id:04X} mid=0x{hdr.method_id:04X} "
+                f"sess={hdr.session_id} values={values}"
+            )
 
         rsp_pl = encode(sigs, values)
-        if _e2e_enabled(method):
+        if _e2e_enabled(msg):
             rsp_pl = e2e_wrap(rsp_pl, counter=hdr.session_id)
 
         rsp = build_message(
-            service_id=svc_id,
-            method_id=method_id,
+            service_id=hdr.service_id,
+            method_id=hdr.method_id,
             client_id=hdr.client_id,
             session_id=hdr.session_id,
             iface_ver=iface_ver,
@@ -282,25 +327,28 @@ def main() -> int:
     stop_evt = threading.Event()
 
     # TCP server (methods)
-    method_by_id = _method_by_id(cat)
-    if not method_by_id:
-        raise SystemExit("No TCP methods found in catalog (kind=method, transport=tcp).")
+    routes = _build_tcp_routes(cat, sig_index)
 
-    first_method = next(iter(method_by_id.values()))
-    tcp_port = args.tcp_port
-    if tcp_port is None:
-        tcp_block = first_method.tcp or {}
-        if "port" not in tcp_block:
-            raise SystemExit(f"Method {first_method.name} missing tcp.port")
-        tcp_port = int(tcp_block["port"])
+    # Por ahora: 1 solo puerto TCP para todos los methods (milestone actual)
+    ports = {int((r.msg.tcp or {}).get("port", 0)) for r in routes.values()}
+    if 0 in ports:
+        raise SystemExit("One or more TCP methods missing tcp.port")
+
+    if args.tcp_port is None:
+        if len(ports) != 1:
+            raise SystemExit(f"Multiple TCP ports in catalog not supported yet: {sorted(ports)}")
+        tcp_port = next(iter(ports))
+    else:
+        tcp_port = int(args.tcp_port)
+
+    first_method = next(iter(routes.values())).msg
 
     def _handler(conn: socket.socket, addr: tuple) -> None:
         _tcp_handler(
             conn,
             addr,
             cat=cat,
-            method=first_method,
-            sig_index=sig_index,
+            routes=routes,
             state=state,
             state_lock=state_lock,
             verbose=args.verbose,
@@ -373,8 +421,8 @@ def main() -> int:
         udp_threads.append(t)
 
     print(
-        f"[node] tcp_methods={sorted(method_by_id.keys())} tcp_listen={args.listen_ip}:{tcp_port} "
-        f"udp_events={[m.msg_id for m in udp_msgs]}"
+        f"[node] tcp_methods={sorted(r.msg.msg_id for r in routes.values())} "
+        f"tcp_listen={args.listen_ip}:{tcp_port} udp_events={[m.msg_id for m in udp_msgs]}"
     )
 
     def _sigint(_signum, _frame):

@@ -95,3 +95,14 @@ messages:
       method_id: 0x0200
     signals: [steering_angle_deg]
     e2e: { enabled: true, crc16: ccitt-false }
+
+  - name: testing_method
+    msg_id: 3
+    kind: method
+    transport: tcp
+    tcp: { port: 30510, timeout_ms: 200 }
+    someip:
+      service: demo_service
+      method_id: 0x0300
+    signals: [vehicle_speed_kph]
+    e2e: { enabled: true, crc16: ccitt-false }

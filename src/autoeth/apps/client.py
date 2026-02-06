@@ -4,7 +4,7 @@ import argparse
 import socket
 from typing import Dict, Optional
 
-from autoeth.core.config import Catalog, MessageDef, load_catalog, resolve_someip
+from autoeth.core.config import Catalog, MessageDef, load_catalog, resolve_someip, get_discovery_cfg
 from autoeth.core.serialization.codec import decode, encode
 from autoeth.core.serialization.index import SignalIndex
 from autoeth.core.transport.udp import join_multicast
@@ -255,8 +255,10 @@ def main() -> int:
     ap.add_argument("--udp-timeout-s", type=float, default=2.0)
 
     ap.add_argument("--discover", action="store_true", help="listen for SD announce and auto-fill tcp-ip/port")
-    ap.add_argument("--sd-group", default="239.0.0.2")
-    ap.add_argument("--sd-port", type=int, default=30490)
+    ap.add_argument("--sd-group", default=None, help="override discovery multicast group")
+    ap.add_argument("--sd-port", type=int, default=None, help="override discovery UDP port")
+    ap.add_argument("--sd-ttl", type=int, default=None, help="override discovery multicast TTL")
+    ap.add_argument("--sd-iface", default=None, help="override discovery interface name")
     ap.add_argument("--sd-timeout-s", type=float, default=2.0)
 
     ap.add_argument("--verbose", action="store_true")
@@ -269,9 +271,19 @@ def main() -> int:
 
     discovered: tuple[str, SdAnnounce] | None = None
     if args.discover:
+        sd_group, sd_port, sd_ttl, sd_iface = get_discovery_cfg(cat)
+        if args.sd_group is not None:
+            sd_group = str(args.sd_group)
+        if args.sd_port is not None:
+            sd_port = int(args.sd_port)
+        if args.sd_ttl is not None:
+            sd_ttl = int(args.sd_ttl)
+        if args.sd_iface is not None:
+            sd_iface = str(args.sd_iface)
+
         tcp_ip, ann = _discover(
-            group=args.sd_group,
-            port=args.sd_port,
+            group=sd_group,
+            port=sd_port,
             bind_ip="0.0.0.0",
             iface_ip=args.iface_ip,
             timeout_s=args.sd_timeout_s,

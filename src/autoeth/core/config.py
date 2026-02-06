@@ -58,6 +58,7 @@ class Catalog:
     signals: List[SignalDef]
     services: List[ServiceDef]
     messages: List[MessageDef]
+    discovery: Optional[Dict[str, Any]] = None
 
     def signals_by_name(self) -> Dict[str, SignalDef]:
         return {s.name: s for s in self.signals}
@@ -72,6 +73,31 @@ class Catalog:
         return {s.name: s for s in self.services}
 
     def validate(self) -> None:
+        # discovery config (required)
+        if not self.discovery:
+            raise ValueError("discovery: missing (required)")
+        if not isinstance(self.discovery, dict):
+            raise ValueError("discovery: expected mapping")
+        disc = self.discovery
+        group = str(disc.get("group", "")).strip()
+        if not group:
+            raise ValueError("discovery.group missing")
+        try:
+            port = int(disc.get("port", 0))
+        except (TypeError, ValueError):
+            raise ValueError("discovery.port invalid")
+        if port <= 0 or port > 65535:
+            raise ValueError("discovery.port invalid")
+        try:
+            ttl = int(disc.get("ttl", 0))
+        except (TypeError, ValueError):
+            raise ValueError("discovery.ttl invalid")
+        if ttl < 0 or ttl > 255:
+            raise ValueError("discovery.ttl invalid")
+        iface = str(disc.get("iface", "")).strip()
+        if not iface:
+            raise ValueError("discovery.iface missing")
+
         # signals unique
         sig_names = [s.name for s in self.signals]
         if len(sig_names) != len(set(sig_names)):
@@ -219,9 +245,24 @@ def load_catalog(path: str | Path) -> Catalog:
         for m in raw.get("messages", [])
     ]
 
-    cat = Catalog(version=version, signals=signals, services=services, messages=messages)
+    cat = Catalog(
+        version=version,
+        signals=signals,
+        services=services,
+        messages=messages,
+        discovery=raw.get("discovery"),
+    )
     cat.validate()
     return cat
+
+
+def get_discovery_cfg(cat: Catalog) -> tuple[str, int, int, str]:
+    disc = cat.discovery or {}
+    group = str(disc.get("group", "")).strip()
+    port = int(disc.get("port", 0))
+    ttl = int(disc.get("ttl", 0))
+    iface = str(disc.get("iface", "")).strip()
+    return group, port, ttl, iface
 
 
 def _normalize_someip(m_raw: Dict[str, Any], name: str) -> Optional[Dict[str, Any]]:

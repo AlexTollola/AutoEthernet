@@ -1,6 +1,17 @@
 # Catalog schema version
 version: 1
 
+# Discovery settings (SD multicast)
+# group: multicast group for SD announcements
+# port: UDP port for SD
+# ttl: multicast TTL
+# iface: interface name for multicast
+discovery:
+  group: 239.0.0.2
+  port: 30490
+  ttl: 1
+  iface: eth0
+
 # Signal definitions shared by messages
 # name: Signal name (referenced by messages)
 # type: Signal data type (u8/u16/u32/i8/i16/i32/f32/f64)

@@ -7,7 +7,7 @@ import threading
 import time
 from typing import Dict, List, Tuple, NamedTuple
 
-from autoeth.core.config import Catalog, MessageDef, SignalDef, load_catalog, resolve_someip
+from autoeth.core.config import Catalog, MessageDef, SignalDef, load_catalog, resolve_someip, get_discovery_cfg
 from autoeth.core.serialization.codec import decode, encode, encoded_size
 from autoeth.core.serialization.index import SignalIndex
 from autoeth.core.transport.tcp import TcpServer
@@ -406,6 +406,10 @@ def main() -> int:
     ap.add_argument("--listen-ip", default="0.0.0.0", help="TCP listen IP")
     ap.add_argument("--tcp-port", type=int, default=None, help="override TCP port (else first TCP method port in catalog)")
     ap.add_argument("--udp-dest-ip", default="127.0.0.1", help="used for UDP unicast mode")
+    ap.add_argument("--sd-group", default=None, help="override discovery multicast group")
+    ap.add_argument("--sd-port", type=int, default=None, help="override discovery UDP port")
+    ap.add_argument("--sd-ttl", type=int, default=None, help="override discovery multicast TTL")
+    ap.add_argument("--sd-iface", default=None, help="override discovery interface name")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -449,14 +453,17 @@ def main() -> int:
 
     # UDP events
     udp_events = _build_udp_events(cat, sig_index)
-    first_event = next(iter(udp_events.values())).msg
-    udp_cfg = first_event.udp or {}
 
-    # SD multicast (use a dedicated group/port)
-    sd_group = "239.0.0.2"
-    sd_port = 30490
-    sd_iface = str(udp_cfg.get("iface")) if str(udp_cfg.get("mode", "unicast")) == "multicast" else None
-    sd_ttl = int(udp_cfg.get("ttl", 1))
+    # SD multicast (from catalog, overridable via CLI)
+    sd_group, sd_port, sd_ttl, sd_iface = get_discovery_cfg(cat)
+    if args.sd_group is not None:
+        sd_group = str(args.sd_group)
+    if args.sd_port is not None:
+        sd_port = int(args.sd_port)
+    if args.sd_ttl is not None:
+        sd_ttl = int(args.sd_ttl)
+    if args.sd_iface is not None:
+        sd_iface = str(args.sd_iface)
 
     ann = _build_sd_announce(cat=cat, routes=routes, udp_events=udp_events)
     sd = SdAnnouncer(

@@ -9,10 +9,14 @@ from autoeth.core.serialization.codec import decode, encode
 from autoeth.core.serialization.index import SignalIndex
 from autoeth.core.transport.udp import join_multicast
 from autoeth.core.validation.e2e import unwrap as e2e_unwrap, wrap as e2e_wrap
-from autoeth.core.service.discovery import SdAnnounce, SdEvent, SdService, parse_sd_datagram
-from autoeth.protocols.someip.header import MT_NOTIFICATION, parse_message, build_message, MT_REQUEST, MT_RESPONSE
+from autoeth.core.service.discovery import (
+    SdAnnounce, SdEvent, SdService,
+    build_sd_subscribe_eventgroup, parse_sd_message, parse_sd_datagram,
+)
+from autoeth.protocols.someip.header import (
+    MT_NOTIFICATION, MT_REQUEST, MT_RESPONSE, parse_message, build_message,
+)
 from autoeth.protocols.someip.stream import recv_someip, send_someip
-
 
 
 def _find_method(cat, name: str) -> MessageDef:
@@ -27,6 +31,7 @@ def _find_event(cat, name: str) -> MessageDef:
         if m.kind == "event" and m.transport == "udp" and m.name == name:
             return m
     raise SystemExit(f"Event not found: {name}")
+
 
 def _e2e_enabled(msg: MessageDef) -> bool:
     return bool((msg.e2e or {}).get("enabled", False))
@@ -71,7 +76,7 @@ def _tcp_call(
     timeout_ms: int,
     verbose: bool,
 ) -> Dict[str, float]:
-    tcp_cfg = method.tcp or {}
+    tcp_cfg    = method.tcp or {}
     port_value = tcp_port if tcp_port is not None else tcp_cfg.get("port")
     if port_value is None:
         raise SystemExit(f"{method.name}: missing tcp.port")
@@ -85,21 +90,18 @@ def _tcp_call(
 
     svc_id, iface_ver, method_id = resolve_someip(cat, method)
 
-    CLIENT_ID = 0x0001
+    CLIENT_ID  = 0x0001
     session_id = 1
 
-    sigs = sig_index.subset(method.signals)
+    sigs    = sig_index.subset(method.signals)
     payload = encode(sigs, values)
     if _e2e_enabled(method):
         payload = e2e_wrap(payload, counter=session_id)
 
     req = build_message(
-        service_id=svc_id,
-        method_id=method_id,
-        client_id=CLIENT_ID,
-        session_id=session_id,
-        iface_ver=iface_ver,
-        msg_type=MT_REQUEST,
+        service_id=svc_id, method_id=method_id,
+        client_id=CLIENT_ID, session_id=session_id,
+        iface_ver=iface_ver, msg_type=MT_REQUEST,
         payload=payload,
     )
 
@@ -132,6 +134,49 @@ def _tcp_call(
     return vals
 
 
+def _send_subscribe_eventgroup(
+    *,
+    server_ip: str,
+    sd_port: int,
+    service_id: int,
+    instance_id: int,
+    major_version: int,
+    eventgroup_id: int,
+    client_ip: str,
+    client_udp_port: int,
+    seq: int = 1,
+    verbose: bool,
+) -> None:
+    """
+    Send a SOME/IP-SD SubscribeEventgroup unicast to the server's SD port.
+    This is a fire-and-forget; the Ack from the server is not awaited here.
+    """
+    msg = build_sd_subscribe_eventgroup(
+        seq=seq,
+        service_id=service_id,
+        instance_id=instance_id,
+        major_version=major_version,
+        eventgroup_id=eventgroup_id,
+        client_ip=client_ip,
+        client_udp_port=client_udp_port,
+        ttl=3,
+    )
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    try:
+        s.sendto(msg, (server_ip, sd_port))
+        if verbose:
+            print(
+                f"[sd] subscribe -> {server_ip}:{sd_port} "
+                f"sid=0x{service_id:04X} eg=0x{eventgroup_id:04X} "
+                f"endpoint={client_ip}:{client_udp_port}"
+            )
+    except OSError as exc:
+        if verbose:
+            print(f"[sd] subscribe send error: {exc}")
+    finally:
+        s.close()
+
+
 def _udp_subscribe(
     *,
     cat: Catalog,
@@ -146,12 +191,12 @@ def _udp_subscribe(
 ) -> None:
     udp_cfg = event.udp or {}
     if discover_event is not None:
-        port = int(discover_event.udp_port)
-        mode = "multicast" if discover_event.udp_mode == 1 else "unicast"
+        port  = int(discover_event.udp_port)
+        mode  = "multicast" if discover_event.udp_mode == 1 else "unicast"
         group = discover_event.mcast_group if mode == "multicast" else ""
     else:
-        port = int(udp_cfg.get("port", 0))
-        mode = str(udp_cfg.get("mode", "unicast"))
+        port  = int(udp_cfg.get("port", 0))
+        mode  = str(udp_cfg.get("mode", "unicast"))
         group = str(udp_cfg.get("mcast_group", ""))
     if not port:
         raise SystemExit(f"{event.name}: missing udp.port")
@@ -174,6 +219,8 @@ def _udp_subscribe(
             desc += f" group={group} iface_ip={iface_ip}"
         print(f"[udp] sub event={event.name} id={event.msg_id} -> {desc} count={count}")
 
+    svc_id, _iface_ver, method_id = resolve_someip(cat, event)
+
     got = 0
     while got < count:
         try:
@@ -182,18 +229,16 @@ def _udp_subscribe(
             print("[udp] timeout waiting for datagram")
             continue
 
-        svc_id, _iface_ver, method_id = resolve_someip(cat, event)
-
         hdr, payload = parse_message(data)
 
         if hdr.service_id != svc_id or hdr.method_id != method_id or hdr.msg_type != MT_NOTIFICATION:
             if verbose:
                 print(
-                    f"[udp] drop someip sid={hdr.service_id:04X} mid={hdr.method_id:04X} type={hdr.msg_type:02X}"
+                    f"[udp] drop someip sid={hdr.service_id:04X} "
+                    f"mid={hdr.method_id:04X} type={hdr.msg_type:02X}"
                 )
             continue
 
-        # Optional E2E check
         if _e2e_enabled(event):
             payload_core, counter = e2e_unwrap(payload)
             if counter != hdr.session_id:
@@ -226,39 +271,39 @@ def _discover(*, group: str, port: int, bind_ip: str, iface_ip: str, timeout_s: 
 
     while True:
         data, addr = s.recvfrom(2048)
+        # Use new parse_sd_message; fall back to backward-compat wrapper
         parsed = parse_sd_datagram(data)
         if not parsed:
             continue
         seq, ann = parsed
         if verbose:
-            print(f"[sd] rx from={addr} seq={seq} ann={ann}")
+            print(f"[sd] rx from={addr} seq={seq}")
         s.close()
-        # Use source IP as the server IP (most reliable)
-        return addr[0], ann
+        return addr[0], ann   # addr[0] = server's actual source IP
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="AutoEth Client (TCP method call + UDP subscribe)")
     ap.add_argument("--catalog", default="configs/catalog.yaml")
 
-    ap.add_argument("--tcp-ip", default="127.0.0.1")
-    ap.add_argument("--tcp-port", type=int, default=None)
+    ap.add_argument("--tcp-ip",     default="127.0.0.1")
+    ap.add_argument("--tcp-port",   type=int, default=None)
     ap.add_argument("--timeout-ms", type=int, default=500)
 
-    ap.add_argument("--call-method", default=None, help="method name to call (catalog message name)")
-    ap.add_argument("--set", action="append", default=[], help="set values: name=value (repeatable)")
+    ap.add_argument("--call-method", default=None)
+    ap.add_argument("--set", action="append", default=[], help="name=value (repeatable)")
 
-    ap.add_argument("--sub-event", default=None, help="event name to subscribe (catalog message name)")
-    ap.add_argument("--udp-bind-ip", default="0.0.0.0")
-    ap.add_argument("--iface-ip", default="0.0.0.0", help="multicast join interface IP")
-    ap.add_argument("--count", type=int, default=5)
-    ap.add_argument("--udp-timeout-s", type=float, default=2.0)
+    ap.add_argument("--sub-event",      default=None)
+    ap.add_argument("--udp-bind-ip",    default="0.0.0.0")
+    ap.add_argument("--iface-ip",       default="0.0.0.0", help="Multicast join interface IP")
+    ap.add_argument("--count",          type=int, default=5)
+    ap.add_argument("--udp-timeout-s",  type=float, default=2.0)
 
-    ap.add_argument("--discover", action="store_true", help="listen for SD announce and auto-fill tcp-ip/port")
-    ap.add_argument("--sd-group", default=None, help="override discovery multicast group")
-    ap.add_argument("--sd-port", type=int, default=None, help="override discovery UDP port")
-    ap.add_argument("--sd-ttl", type=int, default=None, help="override discovery multicast TTL")
-    ap.add_argument("--sd-iface", default=None, help="override discovery interface name")
+    ap.add_argument("--discover",     action="store_true", help="Listen for SD OfferService")
+    ap.add_argument("--sd-group",     default=None)
+    ap.add_argument("--sd-port",      type=int, default=None)
+    ap.add_argument("--sd-ttl",       type=int, default=None)
+    ap.add_argument("--sd-iface",     default=None)
     ap.add_argument("--sd-timeout-s", type=float, default=2.0)
 
     ap.add_argument("--verbose", action="store_true")
@@ -272,31 +317,23 @@ def main() -> int:
     discovered: tuple[str, SdAnnounce] | None = None
     if args.discover:
         sd_group, sd_port, sd_ttl, sd_iface = get_discovery_cfg(cat)
-        if args.sd_group is not None:
-            sd_group = str(args.sd_group)
-        if args.sd_port is not None:
-            sd_port = int(args.sd_port)
-        if args.sd_ttl is not None:
-            sd_ttl = int(args.sd_ttl)
-        if args.sd_iface is not None:
-            sd_iface = str(args.sd_iface)
+        if args.sd_group  is not None: sd_group = str(args.sd_group)
+        if args.sd_port   is not None: sd_port  = int(args.sd_port)
+        if args.sd_ttl    is not None: sd_ttl   = int(args.sd_ttl)
+        if args.sd_iface  is not None: sd_iface = str(args.sd_iface)
 
         tcp_ip, ann = _discover(
-            group=sd_group,
-            port=sd_port,
-            bind_ip="0.0.0.0",
-            iface_ip=args.iface_ip,
-            timeout_s=args.sd_timeout_s,
-            verbose=args.verbose,
+            group=sd_group, port=sd_port,
+            bind_ip="0.0.0.0", iface_ip=args.iface_ip,
+            timeout_s=args.sd_timeout_s, verbose=args.verbose,
         )
         discovered = (tcp_ip, ann)
         _print_sd_summary(ann)
 
-        # If user didn't explicitly set tcp-ip/port, override.
         if args.tcp_ip == "127.0.0.1":
             args.tcp_ip = tcp_ip
 
-    # TCP call
+    # ── TCP method call ──
     if args.call_method:
         method = _find_method(cat, args.call_method)
         if discovered and args.tcp_port is None:
@@ -305,9 +342,11 @@ def main() -> int:
             if svc and svc.tcp_ports:
                 if len(svc.tcp_ports) != 1:
                     raise SystemExit(
-                        f"Discovery has multiple TCP ports for sid=0x{svc_id:04X}: {list(svc.tcp_ports)}"
+                        f"Discovery returned multiple TCP ports for "
+                        f"sid=0x{svc_id:04X}: {list(svc.tcp_ports)}"
                     )
                 args.tcp_port = int(svc.tcp_ports[0])
+
         values: Dict[str, float] = {}
         for item in args.set:
             if "=" not in item:
@@ -316,40 +355,57 @@ def main() -> int:
             values[k.strip()] = float(v.strip())
 
         if not values:
-            # if user didn't provide anything, set defaults for method signals
             for n in method.signals:
                 values[n] = float(sig_index.by_name[n].default)
 
         _tcp_call(
-            cat=cat,
-            method=method,
-            sig_index=sig_index,
-            tcp_ip=args.tcp_ip,
-            tcp_port=args.tcp_port,
-            values=values,
-            timeout_ms=args.timeout_ms,
+            cat=cat, method=method, sig_index=sig_index,
+            tcp_ip=args.tcp_ip, tcp_port=args.tcp_port,
+            values=values, timeout_ms=args.timeout_ms,
             verbose=args.verbose,
         )
 
-    # UDP subscribe
+    # ── UDP event subscribe ──
     if args.sub_event:
         event = _find_event(cat, args.sub_event)
-        disc_event = None
+
+        disc_event: SdEvent | None = None
         if discovered:
+            server_ip, ann = discovered
             svc_id, _iface_ver, event_id = resolve_someip(cat, event)
-            svc = _find_sd_service(discovered[1], svc_id)
+            svc = _find_sd_service(ann, svc_id)
             if svc:
                 disc_event = _find_sd_event(svc, event_id)
+
+            # Send SOME/IP-SD SubscribeEventgroup to the server before listening
+            sd_group, sd_port, _sd_ttl, _sd_iface = get_discovery_cfg(cat)
+            if args.sd_port is not None:
+                sd_port = int(args.sd_port)
+
+            # Resolve client endpoint for the subscribe message
+            client_ip = args.iface_ip if args.iface_ip != "0.0.0.0" else args.udp_bind_ip
+            udp_cfg   = event.udp or {}
+            udp_port  = int(udp_cfg.get("port", 0))
+            svc_def   = cat.services_by_name().get(
+                str((event.someip or {}).get("service", ""))
+            )
+            _send_subscribe_eventgroup(
+                server_ip=server_ip,
+                sd_port=sd_port,
+                service_id=svc_id,
+                instance_id=int(svc_def.instance_id) if svc_def else 0x0001,
+                major_version=int(svc_def.major_version) if svc_def else 1,
+                eventgroup_id=event_id,
+                client_ip=client_ip,
+                client_udp_port=udp_port,
+                verbose=args.verbose,
+            )
+
         _udp_subscribe(
-            cat=cat,
-            event=event,
-            sig_index=sig_index,
-            bind_ip=args.udp_bind_ip,
-            iface_ip=args.iface_ip,
-            count=args.count,
-            timeout_s=args.udp_timeout_s,
-            verbose=args.verbose,
-            discover_event=disc_event,
+            cat=cat, event=event, sig_index=sig_index,
+            bind_ip=args.udp_bind_ip, iface_ip=args.iface_ip,
+            count=args.count, timeout_s=args.udp_timeout_s,
+            verbose=args.verbose, discover_event=disc_event,
         )
 
     if not args.call_method and not args.sub_event:

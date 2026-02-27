@@ -5,7 +5,7 @@ import signal
 import socket
 import threading
 import time
-from typing import Dict, List, Tuple, NamedTuple
+from typing import Dict, List, Set, Tuple, NamedTuple
 
 from autoeth.core.config import Catalog, MessageDef, SignalDef, load_catalog, resolve_someip, get_discovery_cfg
 from autoeth.core.serialization.codec import decode, encode, encoded_size
@@ -13,12 +13,14 @@ from autoeth.core.serialization.index import SignalIndex
 from autoeth.core.transport.tcp import TcpServer
 from autoeth.core.transport import udp as udp_transport
 from autoeth.core.validation.e2e import unwrap as e2e_unwrap, wrap as e2e_wrap
-from autoeth.core.service.discovery import SdAnnounce, SdEvent, SdService, build_sd_datagram
-from autoeth.protocols.someip.header import build_message, MT_NOTIFICATION, MT_REQUEST, MT_RESPONSE, MT_ERROR, RC_OK, RC_NOT_OK
+from autoeth.core.service.discovery import (
+    SdAnnounce, SdEvent, SdService, SdSubscribeEventgroup,
+    build_sd_datagram, build_sd_subscribe_eventgroup_ack, parse_sd_message,
+)
+from autoeth.protocols.someip.header import (
+    build_message, MT_NOTIFICATION, MT_REQUEST, MT_RESPONSE, MT_ERROR, RC_OK, RC_NOT_OK,
+)
 from autoeth.protocols.someip.stream import recv_someip, send_someip
-
-
-
 
 
 def _init_state(signals: List[SignalDef]) -> Dict[str, float]:
@@ -41,6 +43,187 @@ class EventRoute(NamedTuple):
     svc_id: int
     event_id: int
 
+
+# ── Subscriber registry ───────────────────────────────────────────────────────
+
+class SubscriberRegistry:
+    """
+    Thread-safe registry of active eventgroup subscriptions.
+
+    Key: (service_id, eventgroup_id)
+    Value: set of (client_ip, client_udp_port) endpoints
+    """
+
+    def __init__(self) -> None:
+        self._lock: threading.Lock = threading.Lock()
+        self._subs: Dict[Tuple[int, int], Set[Tuple[str, int]]] = {}
+
+    def add(self, service_id: int, eg_id: int, client_ip: str, client_port: int) -> None:
+        key = (service_id, eg_id)
+        with self._lock:
+            self._subs.setdefault(key, set()).add((client_ip, client_port))
+
+    def remove(self, service_id: int, eg_id: int, client_ip: str, client_port: int) -> None:
+        key = (service_id, eg_id)
+        with self._lock:
+            s = self._subs.get(key)
+            if s:
+                s.discard((client_ip, client_port))
+
+    def get_subscribers(self, service_id: int, eg_id: int) -> List[Tuple[str, int]]:
+        key = (service_id, eg_id)
+        with self._lock:
+            return list(self._subs.get(key, set()))
+
+    def has_subscribers(self, service_id: int, eg_id: int) -> bool:
+        key = (service_id, eg_id)
+        with self._lock:
+            return bool(self._subs.get(key))
+
+
+# ── SD subscriber listener ────────────────────────────────────────────────────
+
+class SdSubscriberListener(threading.Thread):
+    """
+    Listens on the SD multicast port for SubscribeEventgroup messages,
+    updates the SubscriberRegistry, and sends SubscribeEventgroupAck replies.
+    """
+
+    def __init__(
+        self,
+        *,
+        sd_group: str,
+        sd_port: int,
+        iface_ip: str,
+        udp_events: Dict[str, EventRoute],
+        registry: SubscriberRegistry,
+        stop_evt: threading.Event,
+        verbose: bool,
+    ) -> None:
+        super().__init__(daemon=True)
+        self._sd_group  = sd_group
+        self._sd_port   = sd_port
+        self._registry  = registry
+        self._stop_evt  = stop_evt
+        self._verbose   = verbose
+        self._seq       = 0
+
+        # (service_id, eventgroup_id) -> EventRoute
+        self._eg_map: Dict[Tuple[int, int], EventRoute] = {
+            (r.svc_id, r.event_id): r for r in udp_events.values()
+        }
+
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.settimeout(0.5)
+        self._sock.bind(("0.0.0.0", sd_port))
+        try:
+            udp_transport.join_multicast(self._sock, sd_group, iface_ip=iface_ip)
+        except Exception as exc:
+            if verbose:
+                print(f"[sd-listener] multicast join warning: {exc}")
+
+    def run(self) -> None:
+        if self._verbose:
+            print(f"[sd-listener] listening on {self._sd_group}:{self._sd_port}")
+
+        while not self._stop_evt.is_set():
+            try:
+                data, addr = self._sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+
+            msg = parse_sd_message(data)
+            if not msg or not msg.subscribes:
+                continue
+
+            for sub in msg.subscribes:
+                self._handle_subscribe(sub, addr)
+
+        try:
+            self._sock.close()
+        except Exception:
+            pass
+
+    def _handle_subscribe(
+        self, sub: SdSubscribeEventgroup, client_addr: Tuple[str, int]
+    ) -> None:
+        key    = (sub.service_id, sub.eventgroup_id)
+        route  = self._eg_map.get(key)
+        if not route:
+            if self._verbose:
+                print(
+                    f"[sd-listener] unknown eventgroup "
+                    f"sid=0x{sub.service_id:04X} eg=0x{sub.eventgroup_id:04X}"
+                )
+            return
+
+        udp_cfg      = route.msg.udp or {}
+        is_multicast = str(udp_cfg.get("mode", "unicast")) == "multicast"
+
+        if sub.ttl > 0:
+            if not is_multicast:
+                self._registry.add(
+                    sub.service_id, sub.eventgroup_id,
+                    sub.client_ip, sub.client_udp_port,
+                )
+            if self._verbose:
+                print(
+                    f"[sd-listener] subscribe sid=0x{sub.service_id:04X} "
+                    f"eg=0x{sub.eventgroup_id:04X} "
+                    f"client={sub.client_ip}:{sub.client_udp_port} ttl={sub.ttl}"
+                )
+            self._send_ack(sub, route, client_addr)
+        else:
+            if not is_multicast:
+                self._registry.remove(
+                    sub.service_id, sub.eventgroup_id,
+                    sub.client_ip, sub.client_udp_port,
+                )
+            if self._verbose:
+                print(
+                    f"[sd-listener] stop-subscribe sid=0x{sub.service_id:04X} "
+                    f"eg=0x{sub.eventgroup_id:04X} "
+                    f"client={sub.client_ip}:{sub.client_udp_port}"
+                )
+
+    def _send_ack(
+        self,
+        sub: SdSubscribeEventgroup,
+        route: EventRoute,
+        client_addr: Tuple[str, int],
+    ) -> None:
+        udp_cfg      = route.msg.udp or {}
+        is_multicast = str(udp_cfg.get("mode", "unicast")) == "multicast"
+        mcast_group  = str(udp_cfg.get("mcast_group", "")) if is_multicast else ""
+        mcast_port   = int(udp_cfg.get("port", 0))         if is_multicast else 0
+
+        self._seq = (self._seq + 1) & 0xFFFF
+        ack = build_sd_subscribe_eventgroup_ack(
+            seq=self._seq,
+            service_id=sub.service_id,
+            instance_id=sub.instance_id,
+            major_version=sub.major_version,
+            eventgroup_id=sub.eventgroup_id,
+            mcast_group=mcast_group,
+            mcast_port=mcast_port,
+            ttl=3,
+        )
+        try:
+            self._sock.sendto(ack, client_addr)
+            if self._verbose:
+                print(
+                    f"[sd-listener] ack -> {client_addr} "
+                    f"eg=0x{sub.eventgroup_id:04X}"
+                )
+        except OSError as exc:
+            if self._verbose:
+                print(f"[sd-listener] ack send error: {exc}")
+
+
+# ── Catalog helpers ───────────────────────────────────────────────────────────
 
 def _build_tcp_routes(cat: Catalog, sig_index: SignalIndex) -> dict[tuple[int, int], MethodRoute]:
     routes: dict[tuple[int, int], MethodRoute] = {}
@@ -72,8 +255,8 @@ def _build_tcp_routes(cat: Catalog, sig_index: SignalIndex) -> dict[tuple[int, i
 
 
 def _build_udp_events(cat: Catalog, sig_index: SignalIndex) -> dict[str, EventRoute]:
-    out: dict[str, EventRoute] = {}
-    used: set[tuple[int, int]] = set()
+    out:  dict[str, EventRoute]   = {}
+    used: set[tuple[int, int]]    = set()
 
     for m in cat.messages:
         if m.kind == "event" and m.transport == "udp":
@@ -109,6 +292,7 @@ def _build_sd_announce(
     cat: Catalog,
     routes: dict[tuple[int, int], MethodRoute],
     udp_events: dict[str, EventRoute],
+    server_ip: str = "0.0.0.0",
 ) -> SdAnnounce:
     services_by_name = cat.services_by_name()
     used_names: set[str] = set()
@@ -127,45 +311,45 @@ def _build_sd_announce(
         if not svc:
             raise SystemExit(f"Discovery: unknown service {svc_name!r}")
 
-        tcp_ports = sorted(
-            {
-                int((r.msg.tcp or {}).get("port", 0))
-                for r in routes.values()
-                if str((r.msg.someip or {}).get("service", "")).strip() == svc_name
-            }
-        )
-        tcp_ports = [p for p in tcp_ports if p]
+        # Collect all TCP ports for this service (one per method message)
+        tcp_ports = sorted({
+            int((r.msg.tcp or {}).get("port", 0))
+            for r in routes.values()
+            if str((r.msg.someip or {}).get("service", "")).strip() == svc_name
+        } - {0})
 
         events: list[SdEvent] = []
         for route in udp_events.values():
             if str((route.msg.someip or {}).get("service", "")).strip() != svc_name:
                 continue
             udp = route.msg.udp or {}
-            mode = str(udp.get("mode", "unicast"))
+            mode     = str(udp.get("mode", "unicast"))
             udp_mode = 1 if mode == "multicast" else 0
-            group = str(udp.get("mcast_group", "0.0.0.0")) if udp_mode == 1 else "0.0.0.0"
-            events.append(
-                SdEvent(
-                    event_id=int(route.event_id),
-                    udp_port=int(udp.get("port", 0)),
-                    mcast_group=group,
-                    udp_mode=udp_mode,
-                    ttl=int(udp.get("ttl", 1)),
-                )
-            )
+            group    = str(udp.get("mcast_group", "0.0.0.0")) if udp_mode else "0.0.0.0"
+            events.append(SdEvent(
+                event_id=int(route.event_id),
+                udp_port=int(udp.get("port", 0)),
+                mcast_group=group,
+                udp_mode=udp_mode,
+                ttl=int(udp.get("ttl", 1)),
+                eventgroup_id=int(route.event_id),  # eventgroup_id == event_id
+            ))
 
-        services.append(
-            SdService(
-                service_id=int(svc.service_id),
-                instance_id=int(svc.instance_id),
-                iface_ver=int(svc.interface_version),
-                tcp_ports=tuple(tcp_ports),
-                events=tuple(events),
-            )
-        )
+        services.append(SdService(
+            service_id=int(svc.service_id),
+            instance_id=int(svc.instance_id),
+            iface_ver=int(svc.interface_version),
+            tcp_ports=tuple(tcp_ports),
+            events=tuple(events),
+            major_version=int(svc.major_version),
+            minor_version=int(svc.minor_version),
+            server_ip=server_ip,
+        ))
 
     return SdAnnounce(services=tuple(services))
 
+
+# ── TCP handler ───────────────────────────────────────────────────────────────
 
 def _tcp_handler(
     conn: socket.socket,
@@ -190,34 +374,27 @@ def _tcp_handler(
                 print(f"[tcp] recv error: {e}")
             continue
 
-        # Solo aceptamos REQUEST
         if hdr.msg_type != MT_REQUEST:
             continue
 
-        key = (hdr.service_id, hdr.method_id)
+        key   = (hdr.service_id, hdr.method_id)
         route = routes.get(key)
         if not route:
             if verbose:
                 print(f"[tcp] unknown method sid=0x{hdr.service_id:04X} mid=0x{hdr.method_id:04X}")
-
             err = build_message(
-                service_id=hdr.service_id,
-                method_id=hdr.method_id,
-                client_id=hdr.client_id,
-                session_id=hdr.session_id,
-                iface_ver=hdr.iface_ver,
-                msg_type=MT_ERROR,
-                payload=b"",
-                return_code=RC_NOT_OK,
+                service_id=hdr.service_id, method_id=hdr.method_id,
+                client_id=hdr.client_id, session_id=hdr.session_id,
+                iface_ver=hdr.iface_ver, msg_type=MT_ERROR,
+                payload=b"", return_code=RC_NOT_OK,
             )
             send_someip(conn, err)
             continue
 
-        msg = route.msg
-        sigs = route.sigs
+        msg      = route.msg
+        sigs     = route.sigs
         iface_ver = route.iface_ver
 
-        # E2E opcional (counter = session_id)
         if _e2e_enabled(msg):
             try:
                 pl_core, counter = e2e_unwrap(pl)
@@ -249,14 +426,10 @@ def _tcp_handler(
             rsp_pl = e2e_wrap(rsp_pl, counter=hdr.session_id)
 
         rsp = build_message(
-            service_id=hdr.service_id,
-            method_id=hdr.method_id,
-            client_id=hdr.client_id,
-            session_id=hdr.session_id,
-            iface_ver=iface_ver,
-            msg_type=MT_RESPONSE,
-            payload=rsp_pl,
-            return_code=RC_OK,
+            service_id=hdr.service_id, method_id=hdr.method_id,
+            client_id=hdr.client_id, session_id=hdr.session_id,
+            iface_ver=iface_ver, msg_type=MT_RESPONSE,
+            payload=rsp_pl, return_code=RC_OK,
         )
         send_someip(conn, rsp)
 
@@ -264,7 +437,16 @@ def _tcp_handler(
         print(f"[tcp] client disconnected: {addr}")
 
 
+# ── UDP event publisher ───────────────────────────────────────────────────────
+
 class UdpEventPublisher(threading.Thread):
+    """
+    Publishes a single UDP event at its configured period.
+
+    Multicast mode: always sends to the multicast group.
+    Unicast mode:   only sends to endpoints registered in the SubscriberRegistry.
+    """
+
     def __init__(
         self,
         *,
@@ -273,35 +455,36 @@ class UdpEventPublisher(threading.Thread):
         state_lock: threading.Lock,
         stop_evt: threading.Event,
         dest_ip: str,
+        registry: SubscriberRegistry,
         verbose: bool,
     ):
         super().__init__(daemon=True)
-        self.msg = route.msg
-        self.sigs = route.sigs
-        self.state = state
+        self.msg        = route.msg
+        self.sigs       = route.sigs
+        self.state      = state
         self.state_lock = state_lock
-        self.stop_evt = stop_evt
-        self.dest_ip = dest_ip
-        self.verbose = verbose
-        self.svc_id = route.svc_id
-        self.iface_ver = route.iface_ver
-        self.event_id = route.event_id
+        self.stop_evt   = stop_evt
+        self.verbose    = verbose
+        self.svc_id     = route.svc_id
+        self.iface_ver  = route.iface_ver
+        self.event_id   = route.event_id
+        self.registry   = registry
 
-        udp_cfg = self.msg.udp or {}
-        self.mode = str(udp_cfg.get("mode", "unicast"))
-        self.group = udp_cfg.get("mcast_group")
-        self.port = int(udp_cfg["port"])
-        self.ttl = int(udp_cfg.get("ttl", 1))
-        self.iface = udp_cfg.get("iface")
+        udp_cfg     = self.msg.udp or {}
+        self.mode   = str(udp_cfg.get("mode", "unicast"))
+        self.group  = udp_cfg.get("mcast_group")
+        self.port   = int(udp_cfg["port"])
+        self.ttl    = int(udp_cfg.get("ttl", 1))
+        self.iface  = udp_cfg.get("iface")
 
-        self.sock = udp_transport.make_socket(iface=self.iface, ttl=self.ttl, bind_ip="0.0.0.0", bind_port=0)
-        self.dest: Tuple[str, int] = udp_transport.dest(self.mode, self.group, self.dest_ip, self.port)
-
+        self.sock = udp_transport.make_socket(
+            iface=self.iface, ttl=self.ttl, bind_ip="0.0.0.0", bind_port=0,
+        )
+        self._mcast_dest: Tuple[str, int] = udp_transport.dest(
+            self.mode, self.group, dest_ip, self.port,
+        )
         self.period_s = max(float(self.msg.period_ms or 1000) / 1000.0, 0.001)
-
         self.seq = 0
-        self.exp_len = encoded_size(self.sigs)
-
 
     def run(self) -> None:
         next_t = time.monotonic()
@@ -309,8 +492,8 @@ class UdpEventPublisher(threading.Thread):
         if self.verbose:
             print(
                 f"[udp] pub {self.msg.name} id={self.msg.msg_id} "
-                f"sid=0x{self.svc_id:04X} eid=0x{self.event_id:04X} -> {self.dest} "
-                f"period_ms={int(self.period_s*1000)}"
+                f"sid=0x{self.svc_id:04X} eid=0x{self.event_id:04X} "
+                f"mode={self.mode} period_ms={int(self.period_s * 1000)}"
             )
 
         while not self.stop_evt.is_set():
@@ -323,8 +506,6 @@ class UdpEventPublisher(threading.Thread):
             with self.state_lock:
                 vals = {s.name: float(self.state.get(s.name, s.default)) for s in self.sigs}
 
-            svc_id, iface_ver, method_id = self.svc_id, self.iface_ver, self.event_id
-
             self.seq = (self.seq + 1) & 0xFFFF
 
             payload = encode(self.sigs, vals)
@@ -332,26 +513,39 @@ class UdpEventPublisher(threading.Thread):
                 payload = e2e_wrap(payload, counter=self.seq)
 
             datagram = build_message(
-                service_id=svc_id,
-                method_id=method_id,
+                service_id=self.svc_id,
+                method_id=self.event_id,
                 client_id=0x0000,
                 session_id=self.seq,
-                iface_ver=iface_ver,
+                iface_ver=self.iface_ver,
                 msg_type=MT_NOTIFICATION,
                 payload=payload,
             )
 
-            try:
-                self.sock.sendto(datagram, self.dest)
-            except OSError as e:
-                if self.verbose:
-                    print(f"[udp] send error {self.msg.name}: {e}")
+            if self.mode == "multicast":
+                # Multicast: always send to the group
+                try:
+                    self.sock.sendto(datagram, self._mcast_dest)
+                except OSError as exc:
+                    if self.verbose:
+                        print(f"[udp] send error {self.msg.name}: {exc}")
+            else:
+                # Unicast: only send to registered subscribers
+                subscribers = self.registry.get_subscribers(self.svc_id, self.event_id)
+                for endpoint in subscribers:
+                    try:
+                        self.sock.sendto(datagram, endpoint)
+                    except OSError as exc:
+                        if self.verbose:
+                            print(f"[udp] send error {self.msg.name} -> {endpoint}: {exc}")
 
         try:
             self.sock.close()
         except Exception:
             pass
 
+
+# ── SD announcer ──────────────────────────────────────────────────────────────
 
 class SdAnnouncer(threading.Thread):
     def __init__(
@@ -366,16 +560,16 @@ class SdAnnouncer(threading.Thread):
         verbose: bool,
     ):
         super().__init__(daemon=True)
-        self.ann = ann
-        self.dest = (group_ip, int(group_port))
+        self.ann      = ann
+        self.dest     = (group_ip, int(group_port))
         self.stop_evt = stop_evt
-        self.verbose = verbose
-        self.sock = udp_transport.make_socket(iface=iface, ttl=ttl, bind_ip="0.0.0.0", bind_port=0)
-        self.seq = 0
+        self.verbose  = verbose
+        self.sock     = udp_transport.make_socket(iface=iface, ttl=ttl, bind_ip="0.0.0.0", bind_port=0)
+        self.seq      = 0
 
     def run(self) -> None:
         if self.verbose:
-            print(f"[sd] announce -> {self.dest} every 1000ms payload={self.ann}")
+            print(f"[sd] announce -> {self.dest} every 1000ms")
 
         next_t = time.monotonic()
         while not self.stop_evt.is_set():
@@ -383,14 +577,14 @@ class SdAnnouncer(threading.Thread):
             if now < next_t:
                 self.stop_evt.wait(next_t - now)
                 continue
-            next_t += 1.0  # 1000 ms
+            next_t += 1.0
 
             d = build_sd_datagram(seq=self.seq, ann=self.ann)
             try:
                 self.sock.sendto(d, self.dest)
-            except OSError as e:
+            except OSError as exc:
                 if self.verbose:
-                    print(f"[sd] send error: {e}")
+                    print(f"[sd] send error: {exc}")
 
             self.seq = (self.seq + 1) & 0xFFFF
 
@@ -400,73 +594,96 @@ class SdAnnouncer(threading.Thread):
             pass
 
 
+# ── Entry point ───────────────────────────────────────────────────────────────
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="AutoEth Node (TCP methods + UDP events)")
-    ap.add_argument("--catalog", default="configs/catalog.yaml", help="canonical catalog YAML")
-    ap.add_argument("--listen-ip", default="0.0.0.0", help="TCP listen IP")
-    ap.add_argument("--tcp-port", type=int, default=None, help="override TCP port (else first TCP method port in catalog)")
-    ap.add_argument("--udp-dest-ip", default="127.0.0.1", help="used for UDP unicast mode")
-    ap.add_argument("--sd-group", default=None, help="override discovery multicast group")
-    ap.add_argument("--sd-port", type=int, default=None, help="override discovery UDP port")
-    ap.add_argument("--sd-ttl", type=int, default=None, help="override discovery multicast TTL")
-    ap.add_argument("--sd-iface", default=None, help="override discovery interface name")
+    ap.add_argument("--catalog", default="configs/catalog.yaml")
+    ap.add_argument("--listen-ip", default="0.0.0.0")
+    ap.add_argument(
+        "--tcp-port", type=int, default=None,
+        help="Override TCP port (only used when catalog has exactly one TCP method port)",
+    )
+    ap.add_argument("--udp-dest-ip", default="127.0.0.1", help="Destination for unicast UDP events")
+    ap.add_argument("--sd-group",  default=None)
+    ap.add_argument("--sd-port",   type=int, default=None)
+    ap.add_argument("--sd-ttl",    type=int, default=None)
+    ap.add_argument("--sd-iface",  default=None)
+    ap.add_argument("--iface-ip",  default="0.0.0.0", help="Multicast join interface IP")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
     cat = load_catalog(args.catalog)
     cat.validate()
 
-    sig_index = SignalIndex.from_signals(cat.signals)
-    state: Dict[str, float] = _init_state(cat.signals)
-    state_lock = threading.Lock()
+    sig_index  = SignalIndex.from_signals(cat.signals)
+    state:      Dict[str, float] = _init_state(cat.signals)
+    state_lock  = threading.Lock()
+    stop_evt    = threading.Event()
 
-    stop_evt = threading.Event()
-
-    # TCP server (methods)
+    # ── TCP servers (one per distinct port) ──
     routes = _build_tcp_routes(cat, sig_index)
 
-    # Por ahora: 1 solo puerto TCP para todos los methods (milestone actual)
-    ports = {int((r.msg.tcp or {}).get("port", 0)) for r in routes.values()}
-    if 0 in ports:
-        raise SystemExit("One or more TCP methods missing tcp.port")
+    ports = sorted({int((r.msg.tcp or {}).get("port", 0)) for r in routes.values()} - {0})
+    if not ports:
+        raise SystemExit("No valid TCP ports found in catalog methods.")
 
-    if args.tcp_port is None:
-        if len(ports) != 1:
-            raise SystemExit(f"Multiple TCP ports in catalog not supported yet: {sorted(ports)}")
-        tcp_port = next(iter(ports))
-    else:
-        tcp_port = int(args.tcp_port)
+    # --tcp-port override: only honoured when catalog has exactly one port
+    if args.tcp_port is not None:
+        if len(ports) == 1:
+            ports = [int(args.tcp_port)]
+        else:
+            print(
+                f"[node] --tcp-port ignored: catalog has multiple TCP ports {ports}. "
+                f"Using catalog ports."
+            )
 
     def _handler(conn: socket.socket, addr: tuple) -> None:
         _tcp_handler(
-            conn,
-            addr,
-            cat=cat,
-            routes=routes,
-            state=state,
-            state_lock=state_lock,
+            conn, addr,
+            cat=cat, routes=routes,
+            state=state, state_lock=state_lock,
             verbose=args.verbose,
         )
 
-    srv = TcpServer(listen_ip=args.listen_ip, port=tcp_port, handler=_handler)
-    srv.start()
+    tcp_servers: List[TcpServer] = []
+    for port in ports:
+        srv = TcpServer(listen_ip=args.listen_ip, port=port, handler=_handler)
+        srv.start()
+        tcp_servers.append(srv)
 
-    # UDP events
+    # ── UDP events ──
     udp_events = _build_udp_events(cat, sig_index)
 
-    # SD multicast (from catalog, overridable via CLI)
+    # ── SD config (catalog defaults, overridable via CLI) ──
     sd_group, sd_port, sd_ttl, sd_iface = get_discovery_cfg(cat)
-    if args.sd_group is not None:
-        sd_group = str(args.sd_group)
-    if args.sd_port is not None:
-        sd_port = int(args.sd_port)
-    if args.sd_ttl is not None:
-        sd_ttl = int(args.sd_ttl)
-    if args.sd_iface is not None:
-        sd_iface = str(args.sd_iface)
+    if args.sd_group  is not None: sd_group = str(args.sd_group)
+    if args.sd_port   is not None: sd_port  = int(args.sd_port)
+    if args.sd_ttl    is not None: sd_ttl   = int(args.sd_ttl)
+    if args.sd_iface  is not None: sd_iface = str(args.sd_iface)
 
-    ann = _build_sd_announce(cat=cat, routes=routes, udp_events=udp_events)
-    sd = SdAnnouncer(
+    # ── Subscriber registry + SD listener ──
+    registry = SubscriberRegistry()
+
+    sd_listener = SdSubscriberListener(
+        sd_group=sd_group,
+        sd_port=sd_port,
+        iface_ip=args.iface_ip,
+        udp_events=udp_events,
+        registry=registry,
+        stop_evt=stop_evt,
+        verbose=args.verbose,
+    )
+    sd_listener.start()
+
+    # ── SD announcer ──
+    ann = _build_sd_announce(
+        cat=cat,
+        routes=routes,
+        udp_events=udp_events,
+        server_ip=args.listen_ip,
+    )
+    sd_announcer = SdAnnouncer(
         ann=ann,
         group_ip=sd_group,
         group_port=sd_port,
@@ -475,9 +692,9 @@ def main() -> int:
         stop_evt=stop_evt,
         verbose=args.verbose,
     )
-    sd.start()
+    sd_announcer.start()
 
-    # UDP publishers (events)
+    # ── UDP event publishers ──
     udp_threads: List[UdpEventPublisher] = []
     for route in udp_events.values():
         t = UdpEventPublisher(
@@ -486,27 +703,29 @@ def main() -> int:
             state_lock=state_lock,
             stop_evt=stop_evt,
             dest_ip=args.udp_dest_ip,
+            registry=registry,
             verbose=args.verbose,
         )
         t.start()
         udp_threads.append(t)
 
     print(
-        f"[node] tcp_methods={sorted(r.msg.msg_id for r in routes.values())} "
-        f"tcp_listen={args.listen_ip}:{tcp_port} "
+        f"[node] tcp_ports={ports} listen={args.listen_ip} "
+        f"tcp_methods={sorted(r.msg.msg_id for r in routes.values())} "
         f"udp_events={[r.msg.msg_id for r in udp_events.values()]}"
     )
 
     def _sigint(_signum, _frame):
         stop_evt.set()
 
-    signal.signal(signal.SIGINT, _sigint)
+    signal.signal(signal.SIGINT,  _sigint)
     signal.signal(signal.SIGTERM, _sigint)
 
     while not stop_evt.is_set():
         stop_evt.wait(0.2)
 
-    srv.stop()
+    for srv in tcp_servers:
+        srv.stop()
     for t in udp_threads:
         t.join(timeout=0.5)
 

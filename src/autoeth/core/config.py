@@ -278,6 +278,9 @@ def _normalize_someip(m_raw: Dict[str, Any], name: str) -> Optional[Dict[str, An
         out["event_id"] = _as_int(out["event_id"], f"{name}.someip.event_id")
     if "method_id" in out:
         out["method_id"] = _as_int(out["method_id"], f"{name}.someip.method_id")
+    # eventgroup_id is optional; if absent it defaults to event_id at runtime
+    if "eventgroup_id" in out:
+        out["eventgroup_id"] = _as_int(out["eventgroup_id"], f"{name}.someip.eventgroup_id")
     return out
 
 
@@ -299,3 +302,18 @@ def resolve_someip(cat: Catalog, msg: MessageDef) -> tuple[int, int, int]:
     else:
         raise ValueError(f"{msg.name}: invalid kind {msg.kind!r}")
     return int(svc.service_id), iface_ver, someip_id
+
+
+def resolve_eventgroup_id(msg: MessageDef) -> int:
+    """
+    Return the SD eventgroup_id for an event message.
+    Falls back to event_id when eventgroup_id is not explicitly defined in the
+    someip block of the catalog (the two IDs are identical in simple setups).
+    """
+    if not msg.someip:
+        raise ValueError(f"{msg.name}: someip missing")
+    if "eventgroup_id" in msg.someip:
+        return int(msg.someip["eventgroup_id"])
+    if "event_id" in msg.someip:
+        return int(msg.someip["event_id"])
+    raise ValueError(f"{msg.name}: no eventgroup_id or event_id in someip block")

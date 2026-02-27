@@ -1,429 +1,386 @@
+"""
+SOME/IP-SD wire format implementation.
+
+Exports used by node.py, client.py and tui.py
+──────────────────────────────────────────────
+Constants:
+  ET_OFFER_SERVICE, ET_SUBSCRIBE_EVENTGROUP, ET_SUBSCRIBE_EVENTGROUP_ACK
+  L4_TCP, L4_UDP
+  SD_FLAG_REBOOT, SD_FLAG_UNICAST
+  TTL_DEFAULT, TTL_STOP
+
+Option dataclasses:
+  Ipv4EndpointOption(address, port, l4_proto)
+  Ipv4MulticastOption(address, port)
+
+Entry dataclasses:
+  ServiceEntry(entry_type, service_id, instance_id, major_version,
+               minor_version, ttl, options)
+  EventgroupEntry(entry_type, service_id, instance_id, major_version,
+                  eventgroup_id, counter, ttl, initial_data_req, options)
+
+Message dataclass:
+  SdMessage(session_id, flags, entries)
+
+Functions:
+  build_sd_message(*, session_id, entries, flags) -> bytes
+  parse_sd_message(data) -> SdMessage | None
+
+Wire format (AUTOSAR SOME/IP-SD):
+  SOME/IP header  service_id=0xFFFF  method_id=0x8100  msg_type=0x02
+  SD payload:
+    flags(u8) + reserved(3)
+    entries_array_length(u32) + N x 16-byte entries
+    options_array_length(u32)  + M x variable options
+"""
+
 from __future__ import annotations
 
 import socket
 import struct
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple, Union
 
-from autoeth.protocols.someip.header import build_message, parse_message, MT_NOTIFICATION
+# ── SOME/IP-SD header IDs ─────────────────────────────────────────────────────
+SD_SERVICE_ID       = 0xFFFF
+SD_METHOD_ID        = 0x8100
+SD_CLIENT_ID        = 0x0000
+SD_IFACE_VER        = 0x01
+_SOMEIP_PROTO_VER   = 0x01
+_SOMEIP_MT_NOTIF    = 0x02
+_SOMEIP_RC_OK       = 0x00
 
-# ── SOME/IP-SD wire constants ─────────────────────────────────────────────────
-
-SD_SERVICE_ID = 0xFFFF
-SD_METHOD_ID  = 0x8100
-SD_IFACE_VER  = 0x01
-SD_CLIENT_ID  = 0x0000
-
+# ── SD Flags ──────────────────────────────────────────────────────────────────
 SD_FLAG_REBOOT  = 0x80
 SD_FLAG_UNICAST = 0x40
 
-# Entry types
-ET_FIND_SERVICE     = 0x00
-ET_OFFER_SERVICE    = 0x01
-ET_SUBSCRIBE_EG     = 0x06
-ET_SUBSCRIBE_EG_ACK = 0x07
+# ── Entry types ───────────────────────────────────────────────────────────────
+ET_FIND_SERVICE             = 0x00
+ET_OFFER_SERVICE            = 0x01
+ET_SUBSCRIBE_EVENTGROUP     = 0x06
+ET_SUBSCRIBE_EVENTGROUP_ACK = 0x07
 
-# Option types
-OT_IPV4_ENDPOINT  = 0x04
-OT_IPV4_MULTICAST = 0x24
+# ── Option types ──────────────────────────────────────────────────────────────
+_OT_IPV4_ENDPOINT  = 0x04
+_OT_IPV4_MULTICAST = 0x14
 
-# L4 protocol codes used inside options
+# ── L4 protocol identifiers ───────────────────────────────────────────────────
 L4_TCP = 0x06
 L4_UDP = 0x11
 
-ENTRY_SZ    = 16   # all SD entry types are exactly 16 bytes
-OPT_IPV4_SZ = 12   # IPv4 endpoint / multicast options are 12 bytes each
+# ── TTL sentinel values ───────────────────────────────────────────────────────
+TTL_STOP    = 0x000000   # StopOffer / StopSubscribe
+TTL_DEFAULT = 0xFFFFFF   # "infinite"
+
+# ── Struct layouts ────────────────────────────────────────────────────────────
+#  SOME/IP header:  service_id(H) method_id(H) length(I)
+#                   client_id(H)  session_id(H)
+#                   proto_ver(B)  iface_ver(B)  msg_type(B)  return_code(B)
+_SOMEIP_HDR  = struct.Struct("!HHIHHBBBB")   # 16 bytes
+
+# SD entry (all types are exactly 16 bytes):
+#   type(B) idx1(B) idx2(B) num_opts(B)
+#   service_id(H) instance_id(H)
+#   major(B) ttl_hi(B) ttl_mid(B) ttl_lo(B)
+#   last32(I)   — minor_version for service entries
+#               — (reserved[11:0] | counter[3:0] | egid[15:0]) for eventgroup
+_SD_ENTRY   = struct.Struct("!BBBBHHBBBBI")  # 16 bytes
+
+# IPv4 option (endpoint and multicast share the same 12-byte layout):
+#   length_field(H)=0x0009  type(B)  reserved(B)
+#   ipv4(I)  reserved(B)  l4_proto(B)  port(H)
+_OPT_IPV4   = struct.Struct("!HBBIBBH")     # 12 bytes
+_OPT_IPV4_LEN_FIELD = 0x0009               # bytes following the Type byte
+
+_ENTRY_SIZE = _SD_ENTRY.size   # 16
+_OPT_SIZE   = _OPT_IPV4.size  # 12
 
 
-# ── High-level dataclasses ────────────────────────────────────────────────────
+# ── Option dataclasses ────────────────────────────────────────────────────────
 
-@dataclass(frozen=True)
-class SdEvent:
-    event_id: int
-    udp_port: int
-    mcast_group: str    # dotted-decimal IPv4; "0.0.0.0" means unicast
-    udp_mode: int       # 1 = multicast, 0 = unicast
-    ttl: int
-    eventgroup_id: int = 0   # SOME/IP-SD eventgroup ID (equals event_id in simple setups)
+@dataclass
+class Ipv4EndpointOption:
+    """IPv4 unicast endpoint option (Type=0x04). TCP or UDP."""
+    address: str
+    port: int
+    l4_proto: int   # L4_TCP or L4_UDP
 
 
-@dataclass(frozen=True)
-class SdService:
+@dataclass
+class Ipv4MulticastOption:
+    """IPv4 multicast option (Type=0x14). Always UDP."""
+    address: str
+    port: int
+
+
+SdOption = Union[Ipv4EndpointOption, Ipv4MulticastOption]
+
+
+# ── Entry dataclasses ─────────────────────────────────────────────────────────
+
+@dataclass
+class ServiceEntry:
+    """OfferService (0x01) or FindService (0x00) entry."""
+    entry_type: int
     service_id: int
     instance_id: int
-    iface_ver: int
-    tcp_ports: tuple        # tuple[int, ...]
-    events: tuple           # tuple[SdEvent, ...]
-    major_version: int = 1
-    minor_version: int = 0
-    server_ip: str = "0.0.0.0"   # node IP embedded in IPv4 Endpoint options
+    major_version: int
+    minor_version: int
+    ttl: int
+    options: List[SdOption] = field(default_factory=list)
 
 
-@dataclass(frozen=True)
-class SdAnnounce:
-    services: tuple   # tuple[SdService, ...]
-
-
-@dataclass(frozen=True)
-class SdSubscribeEventgroup:
-    """Parsed SubscribeEventgroup entry received from a client."""
+@dataclass
+class EventgroupEntry:
+    """SubscribeEventgroup (0x06) or SubscribeEventgroupAck (0x07) entry."""
+    entry_type: int
     service_id: int
     instance_id: int
     major_version: int
     eventgroup_id: int
-    ttl: int             # 0 = StopSubscribeEventgroup
-    client_ip: str
-    client_udp_port: int
+    counter: int
+    ttl: int
+    initial_data_req: bool = False
+    options: List[SdOption] = field(default_factory=list)
 
 
-@dataclass(frozen=True)
+SdEntry = Union[ServiceEntry, EventgroupEntry]
+
+
+# ── Message dataclass ─────────────────────────────────────────────────────────
+
+@dataclass
 class SdMessage:
-    """Fully-parsed SOME/IP-SD datagram (all entry types)."""
+    """Fully-parsed SOME/IP-SD datagram."""
     session_id: int
-    offered: tuple      # tuple[SdService, ...]      from ET_OFFER_SERVICE
-    subscribes: tuple   # tuple[SdSubscribeEventgroup, ...]  from ET_SUBSCRIBE_EG
+    flags: int
+    entries: List[SdEntry]
 
 
-# ── Low-level wire helpers ────────────────────────────────────────────────────
+# ── Internal helpers ──────────────────────────────────────────────────────────
 
-def _u24_pack(v: int) -> bytes:
-    v &= 0xFFFFFF
-    return bytes([(v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF])
-
-
-def _u24_unpack(b: bytes, off: int = 0) -> int:
-    return (b[off] << 16) | (b[off + 1] << 8) | b[off + 2]
+def _ttl_bytes(ttl: int) -> Tuple[int, int, int]:
+    t = max(0, min(int(ttl), 0xFFFFFF))
+    return (t >> 16) & 0xFF, (t >> 8) & 0xFF, t & 0xFF
 
 
-def _opt_ipv4_endpoint(ip: str, port: int, l4: int) -> bytes:
-    """
-    Build a 12-byte IPv4 Endpoint Option (type 0x04).
+def _ttl_from_bytes(b2: int, b1: int, b0: int) -> int:
+    return (int(b2) << 16) | (int(b1) << 8) | int(b0)
 
-    Layout:
-      [0:2]  Length  = 0x0009  (covers bytes 3..11, i.e. everything after Type)
-      [2]    Type    = 0x04
-      [3]    Rsvd    = 0x00
-      [4:8]  IPv4 address
-      [8]    Rsvd    = 0x00
-      [9]    L4 proto (0x06=TCP, 0x11=UDP)
-      [10:12] Port
-    """
-    return (
-        struct.pack("!HBB", 0x0009, OT_IPV4_ENDPOINT, 0x00)
-        + socket.inet_aton(ip)
-        + struct.pack("!BBH", 0x00, l4, port & 0xFFFF)
+
+def _ip_to_u32(ip: str) -> int:
+    return struct.unpack("!I", socket.inet_aton(ip))[0]
+
+
+def _u32_to_ip(v: int) -> str:
+    return socket.inet_ntoa(struct.pack("!I", int(v) & 0xFFFFFFFF))
+
+
+def _pack_option(opt: SdOption) -> bytes:
+    if isinstance(opt, Ipv4EndpointOption):
+        otype = _OT_IPV4_ENDPOINT
+        l4    = int(opt.l4_proto)
+    elif isinstance(opt, Ipv4MulticastOption):
+        otype = _OT_IPV4_MULTICAST
+        l4    = L4_UDP
+    else:
+        raise TypeError(f"Unknown SD option type: {type(opt)}")
+    return _OPT_IPV4.pack(
+        _OPT_IPV4_LEN_FIELD,
+        otype,
+        0x00,
+        _ip_to_u32(opt.address),
+        0x00,
+        l4,
+        int(opt.port) & 0xFFFF,
     )
 
 
-def _opt_ipv4_multicast(group: str, port: int) -> bytes:
-    """Build a 12-byte IPv4 Multicast Option (type 0x24)."""
-    return (
-        struct.pack("!HBB", 0x0009, OT_IPV4_MULTICAST, 0x00)
-        + socket.inet_aton(group)
-        + struct.pack("!BBH", 0x00, L4_UDP, port & 0xFFFF)
-    )
+def _parse_option(data: bytes, offset: int) -> Tuple[Optional[SdOption], int]:
+    """Parse one SD option starting at offset. Returns (option|None, next_offset)."""
+    if offset + 3 > len(data):
+        return None, len(data)
+    length_field = struct.unpack_from("!H", data, offset)[0]
+    opt_type     = data[offset + 2]
+    total        = 2 + 1 + length_field   # length(2) + type(1) + content
+    next_off     = offset + total
+    if next_off > len(data):
+        return None, next_off
+    if opt_type in (_OT_IPV4_ENDPOINT, _OT_IPV4_MULTICAST) and total == _OPT_SIZE:
+        _, _, _, ipv4_u32, _, l4, port = _OPT_IPV4.unpack_from(data, offset)
+        addr = _u32_to_ip(ipv4_u32)
+        if opt_type == _OT_IPV4_ENDPOINT:
+            return Ipv4EndpointOption(address=addr, port=int(port), l4_proto=int(l4)), next_off
+        else:
+            return Ipv4MulticastOption(address=addr, port=int(port)), next_off
+    return None, next_off
 
 
-def _entry_service(
-    etype: int,
-    svc_id: int, inst_id: int, major: int, minor: int, ttl: int,
-    idx1: int = 0, n1: int = 0, idx2: int = 0, n2: int = 0,
-) -> bytes:
-    """Build a 16-byte service entry (OfferService / FindService)."""
-    return (
-        bytes([etype, idx1 & 0xFF, idx2 & 0xFF, ((n1 & 0xF) << 4) | (n2 & 0xF)])
-        + struct.pack("!HHB", svc_id & 0xFFFF, inst_id & 0xFFFF, major & 0xFF)
-        + _u24_pack(ttl)
-        + struct.pack("!I", minor & 0xFFFFFFFF)
-    )
+# ── Public API ────────────────────────────────────────────────────────────────
 
-
-def _entry_eventgroup(
-    etype: int,
-    svc_id: int, inst_id: int, major: int, eg_id: int, ttl: int,
-    counter: int = 0, idx1: int = 0, n1: int = 0, idx2: int = 0, n2: int = 0,
-) -> bytes:
-    """Build a 16-byte eventgroup entry (SubscribeEventgroup / Ack)."""
-    return (
-        bytes([etype, idx1 & 0xFF, idx2 & 0xFF, ((n1 & 0xF) << 4) | (n2 & 0xF)])
-        + struct.pack("!HHB", svc_id & 0xFFFF, inst_id & 0xFFFF, major & 0xFF)
-        + _u24_pack(ttl)
-        + struct.pack("!HH", counter & 0x000F, eg_id & 0xFFFF)
-    )
-
-
-def _sd_payload(entries: bytes, options: bytes, flags: int = SD_FLAG_REBOOT) -> bytes:
-    """Wrap entries + options into the SD payload body."""
-    return (
-        bytes([flags, 0x00, 0x00, 0x00])
-        + struct.pack("!I", len(entries))
-        + entries
-        + struct.pack("!I", len(options))
-        + options
-    )
-
-
-def _sd_msg(payload: bytes, session_id: int) -> bytes:
-    """Wrap SD payload in a SOME/IP header (service=0xFFFF, method=0x8100)."""
-    return build_message(
-        service_id=SD_SERVICE_ID,
-        method_id=SD_METHOD_ID,
-        client_id=SD_CLIENT_ID,
-        session_id=session_id & 0xFFFF,
-        iface_ver=SD_IFACE_VER,
-        msg_type=MT_NOTIFICATION,
-        payload=payload,
-    )
-
-
-# ── Public build functions ────────────────────────────────────────────────────
-
-def build_sd_datagram(*, seq: int, ann: SdAnnounce) -> bytes:
-    """
-    Build a SOME/IP-SD OfferService datagram for all services in ann.
-
-    For each service:
-    - One IPv4 Endpoint option (TCP) per tcp_port in svc.tcp_ports
-    - One IPv4 Multicast option per multicast event in svc.events
-    All options for a service are referenced by a single option run in the entry.
-    """
-    entries = bytearray()
-    options = bytearray()
-
-    for svc in ann.services:
-        opt_start = len(options) // OPT_IPV4_SZ
-        num_opts = 0
-
-        for port in svc.tcp_ports:
-            options += _opt_ipv4_endpoint(svc.server_ip, port, L4_TCP)
-            num_opts += 1
-
-        for ev in svc.events:
-            if ev.udp_mode == 1 and ev.mcast_group not in ("", "0.0.0.0"):
-                options += _opt_ipv4_multicast(ev.mcast_group, ev.udp_port)
-                num_opts += 1
-
-        entries += _entry_service(
-            ET_OFFER_SERVICE,
-            svc.service_id, svc.instance_id,
-            svc.major_version, svc.minor_version,
-            ttl=3,
-            idx1=opt_start, n1=num_opts,
-        )
-
-    return _sd_msg(_sd_payload(bytes(entries), bytes(options)), seq)
-
-
-def build_sd_subscribe_eventgroup(
+def build_sd_message(
     *,
-    seq: int,
-    service_id: int,
-    instance_id: int,
-    major_version: int,
-    eventgroup_id: int,
-    client_ip: str,
-    client_udp_port: int,
-    ttl: int = 3,
-    counter: int = 0,
+    session_id: int,
+    entries: List[SdEntry],
+    flags: int = SD_FLAG_REBOOT | SD_FLAG_UNICAST,
 ) -> bytes:
-    """
-    Build a SOME/IP-SD SubscribeEventgroup datagram.
-    client_ip / client_udp_port: where the client wants to receive unicast events.
-    """
-    opt   = _opt_ipv4_endpoint(client_ip, client_udp_port, L4_UDP)
-    entry = _entry_eventgroup(
-        ET_SUBSCRIBE_EG,
-        service_id, instance_id, major_version, eventgroup_id,
-        ttl=ttl, counter=counter, idx1=0, n1=1,
+    """Build a complete SOME/IP-SD datagram ready to send over UDP."""
+
+    # Flatten per-entry options into a shared global options list
+    all_options: List[SdOption] = []
+    opt_refs: List[Tuple[int, int]] = []   # (start_idx, count) per entry
+    for e in entries:
+        start = len(all_options)
+        all_options.extend(e.options)
+        opt_refs.append((start, len(e.options)))
+
+    opts_bytes = b"".join(_pack_option(o) for o in all_options)
+
+    # Build entries bytes
+    entries_buf = bytearray()
+    for i, e in enumerate(entries):
+        idx1, num_opts = opt_refs[i]
+        # High nibble = num_opts1 (single option run), low nibble = 0
+        num_byte = ((num_opts & 0xF) << 4) | 0x00
+        t2, t1, t0 = _ttl_bytes(e.ttl)
+
+        if isinstance(e, ServiceEntry):
+            entries_buf += _SD_ENTRY.pack(
+                e.entry_type & 0xFF,
+                idx1 & 0xFF, 0x00, num_byte,
+                e.service_id  & 0xFFFF,
+                e.instance_id & 0xFFFF,
+                e.major_version & 0xFF,
+                t2, t1, t0,
+                e.minor_version & 0xFFFFFFFF,
+            )
+        elif isinstance(e, EventgroupEntry):
+            # last32: bits[31:21]=reserved | bit[20]=InitDataReq
+            #         bits[19:16]=Counter  | bits[15:0]=EventgroupID
+            last32 = (e.eventgroup_id & 0xFFFF) | ((e.counter & 0xF) << 16)
+            if e.initial_data_req:
+                last32 |= (1 << 20)
+            entries_buf += _SD_ENTRY.pack(
+                e.entry_type & 0xFF,
+                idx1 & 0xFF, 0x00, num_byte,
+                e.service_id  & 0xFFFF,
+                e.instance_id & 0xFFFF,
+                e.major_version & 0xFF,
+                t2, t1, t0,
+                last32,
+            )
+
+    # SD payload: flags(1)+reserved(3) + entries_len(4)+entries + opts_len(4)+opts
+    sd_body = (
+        struct.pack("!BBBBI", flags & 0xFF, 0, 0, 0, len(entries_buf))
+        + bytes(entries_buf)
+        + struct.pack("!I", len(opts_bytes))
+        + opts_bytes
     )
-    return _sd_msg(_sd_payload(entry, opt), seq)
 
-
-def build_sd_subscribe_eventgroup_ack(
-    *,
-    seq: int,
-    service_id: int,
-    instance_id: int,
-    major_version: int,
-    eventgroup_id: int,
-    mcast_group: str = "",
-    mcast_port: int = 0,
-    server_ip: str = "0.0.0.0",
-    server_udp_port: int = 0,
-    ttl: int = 3,
-    counter: int = 0,
-) -> bytes:
-    """
-    Build a SOME/IP-SD SubscribeEventgroupAck datagram.
-    Include multicast option when mcast_group is set; otherwise unicast endpoint.
-    """
-    opts     = bytearray()
-    num_opts = 0
-    if mcast_group and mcast_group not in ("", "0.0.0.0"):
-        opts += _opt_ipv4_multicast(mcast_group, mcast_port)
-        num_opts += 1
-    elif server_udp_port:
-        opts += _opt_ipv4_endpoint(server_ip, server_udp_port, L4_UDP)
-        num_opts += 1
-
-    entry = _entry_eventgroup(
-        ET_SUBSCRIBE_EG_ACK,
-        service_id, instance_id, major_version, eventgroup_id,
-        ttl=ttl, counter=counter, idx1=0, n1=num_opts,
+    # SOME/IP header: length = 8 (second half of header) + len(sd_body)
+    someip_hdr = _SOMEIP_HDR.pack(
+        SD_SERVICE_ID,
+        SD_METHOD_ID,
+        8 + len(sd_body),
+        SD_CLIENT_ID,
+        int(session_id) & 0xFFFF,
+        _SOMEIP_PROTO_VER,
+        SD_IFACE_VER,
+        _SOMEIP_MT_NOTIF,
+        _SOMEIP_RC_OK,
     )
-    return _sd_msg(_sd_payload(entry, bytes(opts)), seq)
-
-
-# ── SD Parser ─────────────────────────────────────────────────────────────────
-
-def _parse_options(buf: bytes) -> Dict[int, Tuple]:
-    """
-    Parse the SD options block.
-    Returns {option_index: (opt_type, ip_str, port, l4_proto)}.
-
-    Option wire layout:
-      [0:2]  Length  (uint16 BE) = total option size - 3
-                                   (excludes Length field AND Type field)
-      [2]    Type
-      [3...] content (Length bytes)
-
-    Only IPv4 Endpoint (0x04) and IPv4 Multicast (0x24) options are decoded.
-    Unknown option types are counted but skipped.
-    """
-    result: Dict[int, Tuple] = {}
-    pos = 0
-    idx = 0
-    while pos + 3 <= len(buf):
-        length = struct.unpack_from("!H", buf, pos)[0]
-        otype  = buf[pos + 2]
-        opt_total = 3 + length   # Length(2) + Type(1) + length_value
-        if pos + opt_total > len(buf):
-            break
-        if otype in (OT_IPV4_ENDPOINT, OT_IPV4_MULTICAST) and length == 9:
-            ip   = socket.inet_ntoa(buf[pos + 4: pos + 8])
-            l4   = buf[pos + 9]
-            port = struct.unpack_from("!H", buf, pos + 10)[0]
-            result[idx] = (otype, ip, port, l4)
-        pos += opt_total
-        idx += 1
-    return result
+    return someip_hdr + sd_body
 
 
 def parse_sd_message(data: bytes) -> Optional[SdMessage]:
     """
-    Parse a raw UDP payload as a SOME/IP-SD datagram.
-    Returns SdMessage on success, None if not a valid SD datagram.
-
-    Handles ET_OFFER_SERVICE and ET_SUBSCRIBE_EG entries.
-    ET_FIND_SERVICE and ET_SUBSCRIBE_EG_ACK are silently accepted but not decoded.
+    Parse a raw UDP payload as SOME/IP-SD.
+    Returns SdMessage on success, None if data is not a valid SD datagram.
     """
-    if len(data) < 16:   # minimum SOME/IP header size
-        return None
-    try:
-        hdr, payload = parse_message(data)
-    except Exception:
+    if len(data) < _SOMEIP_HDR.size + 8:
         return None
 
-    if hdr.service_id != SD_SERVICE_ID or hdr.method_id != SD_METHOD_ID:
-        return None
-    # SD payload minimum: flags(4) + entries_len(4) + opts_len(4) = 12
-    if len(payload) < 12:
+    svc_id, method_id, length, _, session_id, _, _, msg_type, _ = \
+        _SOMEIP_HDR.unpack_from(data, 0)
+
+    if svc_id != SD_SERVICE_ID or method_id != SD_METHOD_ID:
         return None
 
-    pos = 4  # skip Flags(1) + Reserved(3)
-    entries_len = struct.unpack_from("!I", payload, pos)[0]; pos += 4
+    payload = data[_SOMEIP_HDR.size:]
+
+    # SD header: flags(1) + reserved(3) + entries_length(4)
+    if len(payload) < 8:
+        return None
+
+    flags       = payload[0]
+    entries_len = struct.unpack_from("!I", payload, 4)[0]
+    pos         = 8
+
     if pos + entries_len > len(payload):
         return None
-    entries_buf = payload[pos: pos + entries_len]; pos += entries_len
+
+    entries_data = payload[pos: pos + entries_len]
+    pos += entries_len
 
     if pos + 4 > len(payload):
         return None
-    opts_len = struct.unpack_from("!I", payload, pos)[0]; pos += 4
-    if pos + opts_len > len(payload):
-        return None
-    opts_buf = payload[pos: pos + opts_len]
 
-    options = _parse_options(opts_buf)
+    opts_len = struct.unpack_from("!I", payload, pos)[0]
+    pos += 4
+    opts_data = payload[pos: pos + opts_len]
 
-    offered:    List[SdService]             = []
-    subscribes: List[SdSubscribeEventgroup] = []
+    # Parse options into an indexed list
+    all_opts: List[Optional[SdOption]] = []
+    opt_pos = 0
+    while opt_pos < len(opts_data):
+        opt, opt_pos = _parse_option(opts_data, opt_pos)
+        all_opts.append(opt)
 
-    for i in range(len(entries_buf) // ENTRY_SZ):
-        e = entries_buf[i * ENTRY_SZ: (i + 1) * ENTRY_SZ]
-        if len(e) < ENTRY_SZ:
-            break
+    # Parse entries
+    entries: List[SdEntry] = []
+    e_pos = 0
+    while e_pos + _ENTRY_SIZE <= len(entries_data):
+        (etype, idx1, idx2, num_byte,
+         svc_id_e, inst_id,
+         major, t2, t1, t0,
+         last32) = _SD_ENTRY.unpack_from(entries_data, e_pos)
+        e_pos += _ENTRY_SIZE
 
-        etype  = e[0]
-        idx1   = e[1]
-        idx2   = e[2]
-        n1     = (e[3] >> 4) & 0xF
-        n2     = e[3] & 0xF
-        svc_id, inst_id = struct.unpack_from("!HH", e, 4)
-        major  = e[8]
-        ttl    = _u24_unpack(e, 9)
+        ttl      = _ttl_from_bytes(t2, t1, t0)
+        num_opt1 = (num_byte >> 4) & 0xF
 
-        # All option indices referenced by this entry
-        opt_indices = list(range(idx1, idx1 + n1)) + list(range(idx2, idx2 + n2))
+        entry_opts: List[SdOption] = [
+            all_opts[k]
+            for k in range(idx1, idx1 + num_opt1)
+            if k < len(all_opts) and all_opts[k] is not None
+        ]
 
-        if etype == ET_OFFER_SERVICE:
-            minor     = struct.unpack_from("!I", e, 12)[0]
-            tcp_ports: List[int]    = []
-            ev_list:   List[SdEvent] = []
-
-            for oi in opt_indices:
-                opt = options.get(oi)
-                if not opt:
-                    continue
-                ot, ip, port, l4 = opt
-                if ot == OT_IPV4_ENDPOINT and l4 == L4_TCP:
-                    tcp_ports.append(port)
-                elif ot == OT_IPV4_MULTICAST:
-                    ev_list.append(SdEvent(
-                        event_id=0, udp_port=port, mcast_group=ip,
-                        udp_mode=1, ttl=ttl, eventgroup_id=0,
-                    ))
-
-            offered.append(SdService(
-                service_id=svc_id, instance_id=inst_id, iface_ver=major,
-                tcp_ports=tuple(tcp_ports), events=tuple(ev_list),
-                major_version=major, minor_version=minor,
+        if etype in (ET_OFFER_SERVICE, ET_FIND_SERVICE):
+            entries.append(ServiceEntry(
+                entry_type=etype,
+                service_id=svc_id_e,
+                instance_id=inst_id,
+                major_version=major,
+                minor_version=last32,
+                ttl=ttl,
+                options=entry_opts,
             ))
 
-        elif etype == ET_SUBSCRIBE_EG:
-            eg_id       = struct.unpack_from("!H", e, 14)[0]
-            client_ip   = "0.0.0.0"
-            client_port = 0
-
-            for oi in opt_indices:
-                opt = options.get(oi)
-                if not opt:
-                    continue
-                ot, ip, port, l4 = opt
-                if ot == OT_IPV4_ENDPOINT and l4 == L4_UDP:
-                    client_ip   = ip
-                    client_port = port
-                    break
-
-            subscribes.append(SdSubscribeEventgroup(
-                service_id=svc_id, instance_id=inst_id,
-                major_version=major, eventgroup_id=eg_id,
-                ttl=ttl, client_ip=client_ip, client_udp_port=client_port,
+        elif etype in (ET_SUBSCRIBE_EVENTGROUP, ET_SUBSCRIBE_EVENTGROUP_ACK):
+            counter         = (last32 >> 16) & 0xF
+            eventgroup_id   = last32 & 0xFFFF
+            initial_data_req = bool((last32 >> 20) & 0x1)
+            entries.append(EventgroupEntry(
+                entry_type=etype,
+                service_id=svc_id_e,
+                instance_id=inst_id,
+                major_version=major,
+                eventgroup_id=eventgroup_id,
+                counter=counter,
+                ttl=ttl,
+                initial_data_req=initial_data_req,
+                options=entry_opts,
             ))
 
-    return SdMessage(
-        session_id=hdr.session_id,
-        offered=tuple(offered),
-        subscribes=tuple(subscribes),
-    )
-
-
-def parse_sd_datagram(data: bytes) -> Optional[Tuple[int, SdAnnounce]]:
-    """
-    Backward-compatible wrapper.
-    Returns (session_id, SdAnnounce) if the datagram contains OfferService entries,
-    otherwise None.
-    """
-    msg = parse_sd_message(data)
-    if msg is None or not msg.offered:
-        return None
-    return msg.session_id, SdAnnounce(services=tuple(msg.offered))
+    return SdMessage(session_id=int(session_id), flags=int(flags), entries=entries)

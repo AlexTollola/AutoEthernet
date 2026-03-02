@@ -100,7 +100,7 @@ messages:
     msg_id: 2
     kind: method
     transport: tcp
-    tcp: { port: 30510, timeout_ms: 200 }
+    tcp: { port: 30510, timeout_ms: 500 }
     someip:
       service: demo_service
       method_id: 0x0200
@@ -111,7 +111,7 @@ messages:
     msg_id: 3
     kind: method
     transport: tcp
-    tcp: { port: 30510, timeout_ms: 200 }
+    tcp: { port: 30510, timeout_ms: 500 }
     someip:
       service: demo_service
       method_id: 0x0300

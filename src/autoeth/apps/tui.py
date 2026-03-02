@@ -696,8 +696,8 @@ def _client_auto(ctx: ClientContext) -> None:
                 tcp_ip=ctx.server_ip, tcp_port=None,
                 values=values, timeout_ms=500, verbose=ctx.verbose,
             )
-        except SystemExit as e:
-            print(f"  Error: {e}")
+        except (SystemExit, TimeoutError, OSError, ConnectionRefusedError) as e:
+            print(f"  TCP error ({method.name}): {e}")
 
     print("\n  Receiving — press [q] + Enter to stop.\n")
     while True:
@@ -742,7 +742,7 @@ def _client_manual(ctx: ClientContext) -> None:
 
     while True:
         cmd = _prompt("> ")
-        if cmd.lower() == "b":
+        if cmd.lower() in ("b", "q"):
             break
 
         try:
@@ -773,8 +773,8 @@ def _client_manual(ctx: ClientContext) -> None:
                     tcp_ip=ctx.server_ip, tcp_port=None,
                     values=values, timeout_ms=500, verbose=ctx.verbose,
                 )
-            except SystemExit as e:
-                print(f"  Error: {e}")
+            except (SystemExit, TimeoutError, OSError, ConnectionRefusedError) as e:
+                print(f"  TCP error ({method.name}): {e}")
             _show()
         else:
             print("  Out of range.")

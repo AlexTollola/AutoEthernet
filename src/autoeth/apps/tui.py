@@ -660,8 +660,8 @@ def _client_connect(cat: Catalog, net: NetworkConfig) -> Optional[ClientContext]
             _print_sd_summary(sd_msg)
             print(f"  Discovered server at {server_ip}")
         except socket.timeout:
-            print("  Discover timed out. Falling back to 127.0.0.1")
-            server_ip = "127.0.0.1"
+            print(f"  Discover timed out. Falling back to {net.client_server_ip}")
+            server_ip = net.client_server_ip
     else:
         server_ip = _ask_ip("Server IP", net.client_server_ip)
 

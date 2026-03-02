@@ -15,26 +15,32 @@ server:
   # IP advertised inside SOME/IP-SD OfferService options.
   # Clients use this address to connect via TCP and receive unicast UDP events.
   # Set this to the server's LAN IP so remote clients can reach it.
-  announce_ip: "192.168.0.239"
+  announce_ip: "172.19.5.97"
+  #announce_ip: "192.168.0.239"
 
   # Network interface IP used for multicast (SD announcements + UDP events).
-  # Set this to the server's LAN IP to ensure multicast goes out the right NIC.
-  # Use 0.0.0.0 to let the OS pick (works on single-NIC machines).
-  multicast_iface_ip: "192.168.0.239"
+  # Set this to the server's LAN IP to ensure traffic goes out the right NIC.
+  # NOTE: if both machines are on WiFi, the AP may block multicast between
+  # wireless clients (AP isolation). In that case use Manual IP mode in the
+  # client TUI, or connect both machines via Ethernet instead.
+  multicast_iface_ip: "172.19.5.97"
+  #multicast_iface_ip: "192.168.0.239"
 
 
 # ── Client settings ───────────────────────────────────────────────────────────
 
 client:
-  # Default server IP used when choosing "Manual server IP" in the TUI.
-  # Set this to the server's LAN IP.
-  server_ip: "192.168.0.239"
+  # Default server IP used when choosing "Manual server IP" in the TUI,
+  # and also used as the fallback when SD auto-discover times out.
+  server_ip: "172.19.5.97"
+  #server_ip: "192.168.0.239"
 
   # IP of the client's own network interface used to join multicast groups.
   # Set this to the client's LAN IP so multicast traffic arrives on the right NIC.
-  multicast_iface_ip: "192.168.0.254"
+  multicast_iface_ip: "172.19.5.207"
+  #multicast_iface_ip: "192.168.0.254"
 
   # IP reported to the server inside SubscribeEventgroup options.
   # The server sends unicast UDP events back to this address.
-  # Set this to the client's LAN IP.
-  bind_ip: "192.168.0.254"
+  bind_ip: "172.19.5.207"
+  #bind_ip: "192.168.0.254"

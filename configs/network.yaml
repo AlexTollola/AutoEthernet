@@ -1,0 +1,40 @@
+# AutoEth Network Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+# This file sets the default IPs shown in the TUI prompts.
+# You can still override any value at runtime by typing a new one.
+# Leave a value blank ("") to keep the hardcoded fallback (usually 0.0.0.0).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Server (node) settings ────────────────────────────────────────────────────
+
+server:
+  # IP the TCP servers bind to.
+  # Use 0.0.0.0 to accept connections on all interfaces.
+  listen_ip: "0.0.0.0"
+
+  # IP advertised inside SOME/IP-SD OfferService options.
+  # Clients use this address to connect via TCP and receive unicast UDP events.
+  # Set this to the server's LAN IP so remote clients can reach it.
+  announce_ip: "192.168.0.239"
+
+  # Network interface IP used for multicast (SD announcements + UDP events).
+  # Set this to the server's LAN IP to ensure multicast goes out the right NIC.
+  # Use 0.0.0.0 to let the OS pick (works on single-NIC machines).
+  multicast_iface_ip: "192.168.0.239"
+
+
+# ── Client settings ───────────────────────────────────────────────────────────
+
+client:
+  # Default server IP used when choosing "Manual server IP" in the TUI.
+  # Set this to the server's LAN IP.
+  server_ip: "192.168.0.239"
+
+  # IP of the client's own network interface used to join multicast groups.
+  # Set this to the client's LAN IP so multicast traffic arrives on the right NIC.
+  multicast_iface_ip: "192.168.0.254"
+
+  # IP reported to the server inside SubscribeEventgroup options.
+  # The server sends unicast UDP events back to this address.
+  # Set this to the client's LAN IP.
+  bind_ip: "192.168.0.254"

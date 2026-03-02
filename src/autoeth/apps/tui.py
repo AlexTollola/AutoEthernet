@@ -50,6 +50,47 @@ from autoeth.apps.client import (
     _tcp_call, _subscribe_eventgroup,
 )
 
+import yaml
+from pathlib import Path
+from dataclasses import dataclass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Network configuration loader  (configs/network.yaml)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class NetworkConfig:
+    # Server defaults
+    server_listen_ip:        str = "0.0.0.0"
+    server_announce_ip:      str = "127.0.0.1"
+    server_multicast_iface:  str = "0.0.0.0"
+    # Client defaults
+    client_server_ip:        str = "127.0.0.1"
+    client_multicast_iface:  str = "0.0.0.0"
+    client_bind_ip:          str = "0.0.0.0"
+
+
+def load_network_config(path: str = "configs/network.yaml") -> NetworkConfig:
+    """
+    Load network.yaml if it exists.
+    Missing keys fall back to safe defaults so the file is fully optional.
+    """
+    p = Path(path)
+    if not p.exists():
+        return NetworkConfig()
+    raw = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    srv = raw.get("server", {}) or {}
+    cli = raw.get("client",  {}) or {}
+    return NetworkConfig(
+        server_listen_ip       = str(srv.get("listen_ip",        "0.0.0.0")),
+        server_announce_ip     = str(srv.get("announce_ip",      "127.0.0.1")),
+        server_multicast_iface = str(srv.get("multicast_iface_ip", "0.0.0.0")),
+        client_server_ip       = str(cli.get("server_ip",        "127.0.0.1")),
+        client_multicast_iface = str(cli.get("multicast_iface_ip", "0.0.0.0")),
+        client_bind_ip         = str(cli.get("bind_ip",          "0.0.0.0")),
+    )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tiny terminal helpers
@@ -386,13 +427,13 @@ class EventSubscription(threading.Thread):
 # SERVER menus
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _server_config(cat: Catalog) -> dict:
-    """Ask the user for server parameters."""
+def _server_config(cat: Catalog, net: NetworkConfig) -> dict:
+    """Ask the user for server parameters, defaulting from network.yaml."""
     _header("Server — Configuration")
     sd_group, sd_port, sd_ttl, sd_iface = get_discovery_cfg(cat)
-    listen_ip   = _ask_ip("Listen IP (TCP)",    "0.0.0.0")
-    announce_ip = _ask_ip("Announce IP (SD)",   "127.0.0.1")
-    iface_ip    = _ask_ip("Multicast iface IP", "0.0.0.0")
+    listen_ip   = _ask_ip("Listen IP (TCP)",    net.server_listen_ip)
+    announce_ip = _ask_ip("Announce IP (SD)",   net.server_announce_ip)
+    iface_ip    = _ask_ip("Multicast iface IP", net.server_multicast_iface)
     return dict(
         listen_ip=listen_ip, announce_ip=announce_ip, iface_ip=iface_ip,
         sd_group=sd_group, sd_port=sd_port, sd_ttl=sd_ttl, sd_iface=sd_iface,
@@ -473,8 +514,8 @@ def _server_manual(cat: Catalog, sig_index: SignalIndex, cfg: dict) -> None:
     print("  Server stopped.")
 
 
-def menu_server(cat: Catalog, sig_index: SignalIndex) -> None:
-    cfg = _server_config(cat)
+def menu_server(cat: Catalog, sig_index: SignalIndex, net: NetworkConfig) -> None:
+    cfg = _server_config(cat, net)
 
     while True:
         _header("Server")
@@ -590,7 +631,7 @@ class ClientContext:
             self.toggle_sub(event)
 
 
-def _client_connect(cat: Catalog) -> Optional[ClientContext]:
+def _client_connect(cat: Catalog, net: NetworkConfig) -> Optional[ClientContext]:
     """Gather connection params. Returns ClientContext or None to go back."""
     _header("Client — Connection")
     sd_group, sd_port, _, _ = get_discovery_cfg(cat)
@@ -603,8 +644,8 @@ def _client_connect(cat: Catalog) -> Optional[ClientContext]:
     if cmd.lower() == "b":
         return None
 
-    iface_ip = _ask_ip("Multicast iface IP", "0.0.0.0")
-    bind_ip  = _ask_ip("Local bind IP",      "0.0.0.0")
+    iface_ip = _ask_ip("Multicast iface IP", net.client_multicast_iface)
+    bind_ip  = _ask_ip("Local bind IP",      net.client_bind_ip)
     verbose  = _prompt("  Verbose? [y/N]: ").lower() == "y"
 
     if cmd == "2":
@@ -622,7 +663,7 @@ def _client_connect(cat: Catalog) -> Optional[ClientContext]:
             print("  Discover timed out. Falling back to 127.0.0.1")
             server_ip = "127.0.0.1"
     else:
-        server_ip = _ask_ip("Server IP", "127.0.0.1")
+        server_ip = _ask_ip("Server IP", net.client_server_ip)
 
     return ClientContext(
         cat=cat, sig_index=SignalIndex.from_signals(cat.signals),
@@ -743,8 +784,8 @@ def _client_manual(ctx: ClientContext) -> None:
     print("  All subscriptions stopped.")
 
 
-def menu_client(cat: Catalog, sig_index: SignalIndex) -> None:
-    ctx = _client_connect(cat)
+def menu_client(cat: Catalog, sig_index: SignalIndex, net: NetworkConfig) -> None:
+    ctx = _client_connect(cat, net)
     if ctx is None:
         return
 
@@ -770,10 +811,12 @@ def menu_client(cat: Catalog, sig_index: SignalIndex) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description="AutoEth Terminal UI")
     ap.add_argument("--catalog", default="configs/catalog.yaml")
+    ap.add_argument("--network", default="configs/network.yaml")
     args = ap.parse_args()
 
     cat       = load_catalog(args.catalog)
     sig_index = SignalIndex.from_signals(cat.signals)
+    net       = load_network_config(args.network)
 
     while True:
         _header("AutoEth")
@@ -783,9 +826,9 @@ def main() -> int:
         cmd = _prompt("> ")
 
         if cmd == "1":
-            menu_server(cat, sig_index)
+            menu_server(cat, sig_index, net)
         elif cmd == "2":
-            menu_client(cat, sig_index)
+            menu_client(cat, sig_index, net)
         elif cmd.lower() == "q":
             print("  Bye.")
             break

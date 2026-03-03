@@ -1,33 +1,77 @@
-# Catalog schema version
+# AutoEth Catalog Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+# This file defines all signals, services, and messages for the vehicle network.
+# See docs/architecture.md for detailed documentation.
+# ═══════════════════════════════════════════════════════════════════════════════
+
 version: 1
 
-# Discovery settings (SD multicast)
-# group: multicast group for SD announcements
-# port: UDP port for SD
-# ttl: multicast TTL
-# iface: interface name for multicast
+# ─────────────────────────────────────────────────────────────────────────────────
+# Discovery Settings (SOME/IP-SD)
+# ─────────────────────────────────────────────────────────────────────────────────
 discovery:
   group: 239.0.0.2
   port: 30490
   ttl: 1
   iface: eth0
 
-# Signal definitions shared by messages
-# name: Signal name (referenced by messages)
-# type: Signal data type (u8/u16/u32/i8/i16/i32/f32/f64)
-# scale: Scale factor applied to the raw value
-# offset: Offset applied after scaling
-# unit: Engineering unit label
-# default: Default value used when not explicitly set
+# ─────────────────────────────────────────────────────────────────────────────────
+# Signal Definitions
+# ─────────────────────────────────────────────────────────────────────────────────
+# Signals are the atomic data elements that can be read/written.
+# - name: Unique identifier
+# - type: Data type (u8, i8, u16, i16, u32, i32)
+# - scale: Physical = raw × scale + offset
+# - offset: Physical = raw × scale + offset
+# - unit: Engineering unit for display
+# - default: Initial value on server startup
+# ─────────────────────────────────────────────────────────────────────────────────
 
 signals:
+
+  # ── Chassis Signals ───────────────────────────────────────────────────────────
   
-  - name: vehicle_speed_kph
+  - name: steering_angle
+    type: i16
+    scale: 0.1
+    offset: 0.0
+    unit: deg
+    default: 0.0
+    # Range: -540 to +540 deg (+ = right turn)
+
+  - name: brake_pressure
     type: u16
     scale: 0.1
     offset: 0.0
+    unit: bar
+    default: 0.0
+    # Range: 0 to 200 bar
+
+  - name: vehicle_speed
+    type: u16
+    scale: 0.01
+    offset: 0.0
     unit: kph
     default: 0.0
+    # Range: 0 to 655 kph
+
+  - name: yaw_rate
+    type: i16
+    scale: 0.01
+    offset: 0.0
+    unit: deg/s
+    default: 0.0
+    # Range: -327 to +327 deg/s (+ = clockwise)
+
+  # ── Powertrain Signals ────────────────────────────────────────────────────────
+  
+  - name: throttle_position
+    type: u8
+    scale: 1.0
+    offset: 0.0
+    unit: "%"
+    default: 0.0
+    # Range: 0 to 100 %
 
   - name: engine_rpm
     type: u16
@@ -35,85 +79,240 @@ signals:
     offset: 0.0
     unit: rpm
     default: 800.0
+    # Range: 0 to 8000 rpm (800 = idle)
 
-  - name: steering_angle_deg
+  - name: engine_torque
     type: i16
     scale: 0.1
     offset: 0.0
-    unit: deg
+    unit: Nm
     default: 0.0
+    # Range: -500 to +500 Nm
+
+  - name: gear_position
+    type: i8
+    scale: 1.0
+    offset: 0.0
+    unit: ""
+    default: 0.0
+    # Range: -1 (R), 0 (N), 1-6 (forward gears)
 
 
-# Service definitions (SOME/IP + instance metadata)
-# SOME/IP service ID (hex allowed)
-# SOME/IP instance ID (hex allowed)
-# SOME/IP interface version
-# SOME/IP service major version
-# SOME/IP service minor version
+# ─────────────────────────────────────────────────────────────────────────────────
+# Service Definitions
+# ─────────────────────────────────────────────────────────────────────────────────
+# Services group related functionality and are identified by SOME/IP service IDs.
+# - service_id: SOME/IP service identifier (hex)
+# - instance_id: SOME/IP instance identifier (hex)
+# - interface_version: API version
+# - major_version / minor_version: Service version
+# ─────────────────────────────────────────────────────────────────────────────────
 
 services:
-  - name: demo_service
-    service_id: 0x1234
+
+  - name: chassis_service
+    service_id: 0x1001
     instance_id: 0x0001
     interface_version: 1
     major_version: 1
     minor_version: 0
 
-# Message definitions (events/methods)
-# name: Message name
-# msg_id: Message ID used by AutoEth framing
-# kind: event or method
-# transport: udp or tcp
-# period_ms: Event publishing period (ms)
-# udp.mode: UDP mode (unicast or multicast)
-# udp.mcast_group: Multicast group IP (when mode=multicast)
-# udp.port: UDP destination port
-# udp.ttl: Multicast TTL / hop limit
-# udp.iface: Interface name for multicast (platform-specific)
-# tcp.port: TCP listen/connect port
-# tcp.timeout_ms: TCP request timeout in ms
-# someip.service: Service name reference from services[]
-# someip.event_id: SOME/IP event ID (hex allowed)
-# signals: Signal list encoded in payload
-# e2e.enabled: Enable end-to-end protection
-# e2e.crc16: CRC algorithm name
+  - name: powertrain_service
+    service_id: 0x1002
+    instance_id: 0x0001
+    interface_version: 1
+    major_version: 1
+    minor_version: 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Message Definitions
+# ─────────────────────────────────────────────────────────────────────────────────
+# Messages define the protocol-level communication:
+# - Methods (TCP): Request/response for writing to server database
+# - Events (UDP): Periodic broadcast of database state
+#
+# Method behavior:
+#   Client sends signal values → Server writes to database → Server responds with written values
+#
+# Event behavior:
+#   Server reads database → Server broadcasts to all subscribers periodically
+# ─────────────────────────────────────────────────────────────────────────────────
 
 messages:
-  - name: fast_dynamics_event
-    msg_id: 1
-    kind: event
-    transport: udp
-    period_ms: 50
-    udp:
-      mode: multicast
-      mcast_group: 239.255.0.1
-      port: 30509
-      ttl: 1
-      iface: eth0
-    someip:
-      service: demo_service
-      event_id: 0x0100
-    signals: [vehicle_speed_kph, engine_rpm, steering_angle_deg]
-    e2e: { enabled: true, crc16: ccitt-false }
 
-  - name: control_method
+  # ═══════════════════════════════════════════════════════════════════════════════
+  # CHASSIS SERVICE - Methods (TCP Port 30501)
+  # ═══════════════════════════════════════════════════════════════════════════════
+
+  - name: set_steering
+    msg_id: 1
+    kind: method
+    transport: tcp
+    tcp:
+      port: 30501
+      timeout_ms: 200
+    someip:
+      service: chassis_service
+      method_id: 0x0001
+    signals: [steering_angle]
+    e2e:
+      enabled: true
+      crc16: ccitt-false
+
+  - name: set_brakes
     msg_id: 2
     kind: method
     transport: tcp
-    tcp: { port: 30510, timeout_ms: 500 }
+    tcp:
+      port: 30501
+      timeout_ms: 200
     someip:
-      service: demo_service
-      method_id: 0x0200
-    signals: [steering_angle_deg]
-    e2e: { enabled: true, crc16: ccitt-false }
+      service: chassis_service
+      method_id: 0x0002
+    signals: [brake_pressure]
+    e2e:
+      enabled: true
+      crc16: ccitt-false
 
-  - name: testing_method
+  - name: set_vehicle_speed
     msg_id: 3
     kind: method
     transport: tcp
-    tcp: { port: 30510, timeout_ms: 500 }
+    tcp:
+      port: 30501
+      timeout_ms: 200
     someip:
-      service: demo_service
-      method_id: 0x0300
-    signals: [vehicle_speed_kph]
-    e2e: { enabled: true, crc16: ccitt-false }
+      service: chassis_service
+      method_id: 0x0003
+    signals: [vehicle_speed]
+    e2e:
+      enabled: true
+      crc16: ccitt-false
+
+  - name: set_yaw_rate
+    msg_id: 4
+    kind: method
+    transport: tcp
+    tcp:
+      port: 30501
+      timeout_ms: 200
+    someip:
+      service: chassis_service
+      method_id: 0x0004
+    signals: [yaw_rate]
+    e2e:
+      enabled: true
+      crc16: ccitt-false
+
+  # ═══════════════════════════════════════════════════════════════════════════════
+  # CHASSIS SERVICE - Events (UDP Multicast 239.255.1.1:30511)
+  # ═══════════════════════════════════════════════════════════════════════════════
+
+  - name: chassis_dynamics_event
+    msg_id: 10
+    kind: event
+    transport: udp
+    period_ms: 25
+    udp:
+      mode: multicast
+      mcast_group: 239.255.1.1
+      port: 30511
+      ttl: 1
+      iface: eth0
+    someip:
+      service: chassis_service
+      event_id: 0x8001
+      eventgroup_id: 0x0001
+    signals: [steering_angle, brake_pressure, vehicle_speed, yaw_rate]
+    e2e:
+      enabled: true
+      crc16: ccitt-false
+
+  # ═══════════════════════════════════════════════════════════════════════════════
+  # POWERTRAIN SERVICE - Methods (TCP Port 30502)
+  # ═══════════════════════════════════════════════════════════════════════════════
+
+  - name: set_throttle
+    msg_id: 20
+    kind: method
+    transport: tcp
+    tcp:
+      port: 30502
+      timeout_ms: 200
+    someip:
+      service: powertrain_service
+      method_id: 0x0001
+    signals: [throttle_position]
+    e2e:
+      enabled: true
+      crc16: ccitt-false
+
+  - name: set_engine_rpm
+    msg_id: 21
+    kind: method
+    transport: tcp
+    tcp:
+      port: 30502
+      timeout_ms: 200
+    someip:
+      service: powertrain_service
+      method_id: 0x0002
+    signals: [engine_rpm]
+    e2e:
+      enabled: true
+      crc16: ccitt-false
+
+  - name: set_engine_torque
+    msg_id: 22
+    kind: method
+    transport: tcp
+    tcp:
+      port: 30502
+      timeout_ms: 200
+    someip:
+      service: powertrain_service
+      method_id: 0x0003
+    signals: [engine_torque]
+    e2e:
+      enabled: true
+      crc16: ccitt-false
+
+  - name: set_gear
+    msg_id: 23
+    kind: method
+    transport: tcp
+    tcp:
+      port: 30502
+      timeout_ms: 200
+    someip:
+      service: powertrain_service
+      method_id: 0x0004
+    signals: [gear_position]
+    e2e:
+      enabled: true
+      crc16: ccitt-false
+
+  # ═══════════════════════════════════════════════════════════════════════════════
+  # POWERTRAIN SERVICE - Events (UDP Multicast 239.255.1.2:30512)
+  # ═══════════════════════════════════════════════════════════════════════════════
+
+  - name: powertrain_status_event
+    msg_id: 30
+    kind: event
+    transport: udp
+    period_ms: 25
+    udp:
+      mode: multicast
+      mcast_group: 239.255.1.2
+      port: 30512
+      ttl: 1
+      iface: eth0
+    someip:
+      service: powertrain_service
+      event_id: 0x8001
+      eventgroup_id: 0x0001
+    signals: [throttle_position, engine_rpm, engine_torque, gear_position]
+    e2e:
+      enabled: true
+      crc16: ccitt-false

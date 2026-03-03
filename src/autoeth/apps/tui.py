@@ -96,7 +96,7 @@ def load_network_config(path: str = "configs/network.yaml") -> NetworkConfig:
 # Tiny terminal helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-_DIVIDER = "─" * 52
+_DIVIDER = "─" * 60
 
 def _header(title: str) -> None:
     print(f"\n{_DIVIDER}")
@@ -309,7 +309,7 @@ class UdpEventPublisherWithDb(threading.Thread):
     def run(self) -> None:
         if self.verbose:
             print(f"[udp] pub {self.msg.name} sid=0x{self.svc_id:04X} "
-                  f"eid=0x{self.event_id:04X} mode={self.mode} period_ms={int(self.period_s*1000)}")
+                  f"eid=0x{self.event_id:04X} mode={self.mode} period={self.msg.period_ms}ms")
         next_t = time.monotonic()
         while not self.stop_evt.is_set():
             now = time.monotonic()
@@ -354,7 +354,7 @@ class UdpEventPublisherWithDb(threading.Thread):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Server infrastructure (shared by auto and manual server modes)
+# Server infrastructure
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ServerContext:
@@ -399,8 +399,8 @@ class ServerContext:
         # name → (running publisher, stop_event)
         self._publishers: Dict[str, Tuple[UdpEventPublisherWithDb, threading.Event]] = {}
 
-    # ── Start TCP + SD (always on) ────────────────────────────────────────────
     def start_infrastructure(self) -> None:
+        """Start TCP servers + SD announcer/listener."""
         # TCP servers — one per unique port
         all_ports: set[int] = set()
         for r in self.routes.values():
@@ -442,7 +442,6 @@ class ServerContext:
         )
         self._sd_listener.start()
 
-    # ── Event publisher control ───────────────────────────────────────────────
     def is_publishing(self, name: str) -> bool:
         return name in self._publishers
 
@@ -478,19 +477,12 @@ class ServerContext:
             if name not in self._publishers:
                 self.toggle_event(name)
 
-    # ── Database access ───────────────────────────────────────────────────────
     def get_database_values(self) -> Dict[str, float]:
         """Get all current values from the database."""
         return self.database.get_all()
-    
-    def set_database_value(self, name: str, value: float) -> None:
-        """Set a value in the database."""
-        self.database.set(name, value)
 
-    # ── Full shutdown ─────────────────────────────────────────────────────────
     def stop_all(self) -> None:
         self.stop_evt.set()
-        # Stop individual publishers
         for name in list(self._publishers.keys()):
             _, pub_stop = self._publishers.pop(name)
             pub_stop.set()
@@ -516,7 +508,7 @@ class EventSubscription(threading.Thread):
         self.bind_ip   = bind_ip
         self.iface_ip  = iface_ip
         self.verbose   = verbose
-        self.quiet     = quiet  # If True, don't print each message
+        self.quiet     = quiet
         self._stop     = threading.Event()
 
         udp_cfg    = event.udp or {}
@@ -545,7 +537,7 @@ class EventSubscription(threading.Thread):
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.settimeout(1.0)
         
-        # For multicast, must bind to 0.0.0.0 (not interface IP) to receive group traffic
+        # For multicast, must bind to 0.0.0.0 to receive group traffic
         if self.mode == "multicast":
             s.bind(("0.0.0.0", self.port))
         else:
@@ -590,13 +582,12 @@ class EventSubscription(threading.Thread):
             self.last_values = vals
 
             if not self.quiet:
-                print(
-                    f"\n  [rx] {self.event.name}  #{self.count}"
-                    f"  sid=0x{hdr.service_id:04X}  sess={hdr.session_id}"
-                    f"\n       {vals}"
-                    f"\n> ",
-                    end="", flush=True,
-                )
+                print(f"\n  [rx] {self.event.name}  #{self.count}  sess={hdr.session_id}")
+                for k, v in vals.items():
+                    sig = self.sig_index.by_name.get(k)
+                    unit = sig.unit if sig else ""
+                    print(f"       {k}: {v:.2f} {unit}")
+                print("> ", end="", flush=True)
 
         try:
             s.close()
@@ -609,7 +600,7 @@ class EventSubscription(threading.Thread):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _server_config(cat: Catalog, net: NetworkConfig) -> dict:
-    """Ask the user for server parameters, defaulting from network.yaml."""
+    """Ask the user for server parameters."""
     _header("Server — Configuration")
     sd_group, sd_port, sd_ttl, sd_iface = get_discovery_cfg(cat)
     listen_ip   = _ask_ip("Listen IP (TCP)",    net.server_listen_ip)
@@ -622,41 +613,15 @@ def _server_config(cat: Catalog, net: NetworkConfig) -> dict:
 
 
 def _show_database(ctx: ServerContext) -> None:
-    """Display current database values."""
-    print("\n  ── Signal Database ──")
+    """Display current database values grouped by service."""
+    print("\n  ── Signal Database (read-only, updated via TCP methods) ──")
     values = ctx.get_database_values()
-    for name, value in sorted(values.items()):
+    for name in sorted(values.keys()):
+        value = values[name]
         sig = ctx.database.get_signal_info(name)
         unit = sig.unit if sig else ""
-        print(f"    {name:<25} = {value:>10.2f} {unit}")
+        print(f"    {name:<20} = {value:>10.2f} {unit}")
     print()
-
-
-def _edit_database(ctx: ServerContext) -> None:
-    """Let user edit database values."""
-    print("\n  ── Edit Signal Values ──")
-    signals = ctx.database.list_signals()
-    for idx, name in enumerate(signals, start=1):
-        value = ctx.database.get(name)
-        sig = ctx.database.get_signal_info(name)
-        unit = sig.unit if sig else ""
-        print(f"    [{idx}] {name:<22} = {value:>10.2f} {unit}")
-    print("    [b] Back")
-    
-    cmd = _prompt("  Select signal to edit: ")
-    if cmd.lower() == "b":
-        return
-    
-    try:
-        n = int(cmd)
-        if 1 <= n <= len(signals):
-            name = signals[n - 1]
-            current = ctx.database.get(name)
-            new_val = _ask_float(f"    New value for {name}", current)
-            ctx.database.set(name, new_val)
-            print(f"    {name} = {new_val}")
-    except ValueError:
-        print("  Invalid selection.")
 
 
 def _server_auto(cat: Catalog, sig_index: SignalIndex, cfg: dict) -> None:
@@ -666,33 +631,33 @@ def _server_auto(cat: Catalog, sig_index: SignalIndex, cfg: dict) -> None:
     ctx.start_infrastructure()
     ctx.start_all_events()
 
-    ports = sorted({int((r.msg.tcp or {}).get("port", 0)) for r in ctx.routes.values()})
+    # Collect info for display
+    tcp_ports = sorted({int((r.msg.tcp or {}).get("port", 0)) for r in ctx.routes.values()})
+    methods = [r.msg.name for r in ctx.routes.values()]
     events = list(ctx.udp_events.keys())
-    print(f"  TCP ports  : {ports}")
-    print(f"  UDP events : {events}")
-    print(f"  SD group   : {cfg['sd_group']}:{cfg['sd_port']}")
-    print("\n  Commands:")
-    print("    [s] Show status    [d] Show database")
-    print("    [e] Edit values    [q] Quit\n")
+    
+    print(f"  TCP ports : {tcp_ports}")
+    print(f"  Methods   : {methods}")
+    print(f"  Events    : {events}")
+    print(f"  SD group  : {cfg['sd_group']}:{cfg['sd_port']}")
+    print()
+    print("  Commands:  [d] database  [s] status  [q] quit")
+    print()
 
     while True:
         cmd = _prompt("> ")
         if cmd.lower() == "q":
             break
-        elif cmd.lower() == "s":
-            print("\n  ── Status ──")
-            for name in events:
-                tx = ctx.get_tx_count(name)
-                subs = len(ctx.registry.get_subscribers(
-                    ctx.udp_events[name].svc_id,
-                    ctx.udp_events[name].eventgroup_id
-                ))
-                print(f"    {name}: tx={tx}  subscribers={subs}")
-            print()
         elif cmd.lower() == "d":
             _show_database(ctx)
-        elif cmd.lower() == "e":
-            _edit_database(ctx)
+        elif cmd.lower() == "s":
+            print("\n  ── Event Status ──")
+            for name in events:
+                tx = ctx.get_tx_count(name)
+                route = ctx.udp_events[name]
+                subs = len(ctx.registry.get_subscribers(route.svc_id, route.eventgroup_id))
+                print(f"    {name}: tx={tx}  subscribers={subs}")
+            print()
 
     ctx.stop_all()
     print("  Server stopped.")
@@ -704,15 +669,16 @@ def _server_manual(cat: Catalog, sig_index: SignalIndex, cfg: dict) -> None:
     ctx = ServerContext(cat=cat, sig_index=sig_index, verbose=True, **cfg)
     ctx.start_infrastructure()
 
-    ports  = sorted({int((r.msg.tcp or {}).get("port", 0)) for r in ctx.routes.values()})
+    tcp_ports = sorted({int((r.msg.tcp or {}).get("port", 0)) for r in ctx.routes.values()})
     events = list(ctx.udp_events.keys())
+    methods = [r.msg for r in ctx.routes.values()]
 
-    print(f"  TCP servers started on ports {ports}  [always on]")
-    print(f"  SD Announcer + Listener running  [always on]")
+    print(f"  TCP servers on ports {tcp_ports}  [always on]")
+    print(f"  SD Announcer + Listener  [always on]")
 
-    def _show_events() -> None:
+    def _show_menu() -> None:
         print()
-        print("  Events:")
+        print("  ── Events (toggle on/off) ──")
         for idx, name in enumerate(events, start=1):
             if name in ctx._publishers:
                 tx = ctx.get_tx_count(name)
@@ -723,18 +689,19 @@ def _server_manual(cat: Catalog, sig_index: SignalIndex, cfg: dict) -> None:
             period = route.msg.period_ms or "?"
             mode   = str((route.msg.udp or {}).get("mode", "unicast"))
             subs   = len(ctx.registry.get_subscribers(route.svc_id, route.eventgroup_id))
-            print(f"    [{idx}] {name:<22} [{state:<12}]  {period}ms  {mode}  subs={subs}")
+            print(f"    [{idx}] {name:<26} [{state:<12}] {period}ms {mode} subs={subs}")
         
-        methods = [r.msg for r in ctx.routes.values()]
         print()
-        print("  Methods (TCP):")
-        for idx, m in enumerate(methods, start=len(events) + 1):
+        print("  ── Methods (TCP, always on) ──")
+        for m in methods:
             port = int((m.tcp or {}).get("port", 0))
-            print(f"    [{idx}] {m.name:<22} [TCP]  port={port}  (always on)")
+            sigs = ", ".join(m.signals)
+            print(f"        {m.name:<26} port={port}  signals=[{sigs}]")
+        
         print()
-        print("  [d] Database  [e] Edit values  [b] Back / stop server")
+        print("  Commands:  [d] database  [b] back/stop")
 
-    _show_events()
+    _show_menu()
 
     while True:
         cmd = _prompt("> ")
@@ -742,25 +709,19 @@ def _server_manual(cat: Catalog, sig_index: SignalIndex, cfg: dict) -> None:
             break
         elif cmd.lower() == "d":
             _show_database(ctx)
-            _show_events()
-            continue
-        elif cmd.lower() == "e":
-            _edit_database(ctx)
-            _show_events()
-            continue
-        
-        try:
-            n = int(cmd)
-        except ValueError:
-            _show_events()
-            continue
-        if 1 <= n <= len(events):
-            name = events[n - 1]
-            now  = ctx.toggle_event(name)
-            print(f"  {name} → {'ON' if now else 'OFF'}")
+            _show_menu()
         else:
-            print("  Out of range.")
-        _show_events()
+            try:
+                n = int(cmd)
+                if 1 <= n <= len(events):
+                    name = events[n - 1]
+                    now = ctx.toggle_event(name)
+                    print(f"  {name} → {'ON' if now else 'OFF'}")
+                else:
+                    print("  Invalid number.")
+            except ValueError:
+                pass
+            _show_menu()
 
     ctx.stop_all()
     print("  Server stopped.")
@@ -771,7 +732,7 @@ def menu_server(cat: Catalog, sig_index: SignalIndex, net: NetworkConfig) -> Non
 
     while True:
         _header("Server")
-        print("  [1] Automatic   — start everything")
+        print("  [1] Automatic   — start all events")
         print("  [2] Manual      — toggle individual events")
         print("  [b] Back")
         cmd = _prompt("> ")
@@ -803,21 +764,17 @@ class ClientContext:
         self.sd_port    = sd_port
         self.bind_ip    = bind_ip
         self.verbose    = verbose
-        # name → EventSubscription
         self._subs: Dict[str, EventSubscription] = {}
-        # Track method call counts
         self._method_calls: Dict[str, int] = {}
 
     def is_subscribed(self, name: str) -> bool:
         return name in self._subs
 
     def get_rx_count(self, name: str) -> int:
-        """Get the RX count for a subscription."""
         sub = self._subs.get(name)
         return sub.count if sub else 0
 
     def get_last_values(self, name: str) -> Optional[Dict[str, float]]:
-        """Get the last received values for a subscription."""
         sub = self._subs.get(name)
         return sub.last_values if sub else None
 
@@ -825,19 +782,17 @@ class ClientContext:
         name = event.name
         if name in self._subs:
             self._subs.pop(name).stop()
-            # Send StopSubscribeEventgroup for unicast
             udp_cfg = event.udp or {}
             if str(udp_cfg.get("mode", "unicast")) != "multicast":
                 self._send_subscribe(event, stop=True)
             return False
         else:
-            # Subscribe via SD for unicast
             udp_cfg = event.udp or {}
             port    = int(udp_cfg.get("port", 0))
             mode    = str(udp_cfg.get("mode", "unicast"))
             if mode != "multicast":
                 svc_id, _, _ = resolve_someip(self.cat, event)
-                svc   = next((s for s in self.cat.services if s.service_id == svc_id), None)
+                svc = next((s for s in self.cat.services if s.service_id == svc_id), None)
                 _subscribe_eventgroup(
                     sd_group=self.sd_group, sd_port=self.sd_port,
                     client_ip=self.bind_ip if self.bind_ip != "0.0.0.0" else "127.0.0.1",
@@ -895,18 +850,16 @@ class ClientContext:
             self.toggle_sub(event)
 
 
-def _tcp_call_with_response(
+def _tcp_call(
     *, cat: Catalog, method: MessageDef, sig_index: SignalIndex,
     tcp_ip: str, tcp_port: Optional[int],
     values: Dict[str, float], timeout_ms: int, verbose: bool,
 ) -> Dict[str, float]:
-    """Make a TCP call and return the response values."""
-    from autoeth.core.transport.tcp import TcpClient
-    
+    """Make a TCP method call and return the response values."""
     tcp_cfg    = method.tcp or {}
     port_value = tcp_port if tcp_port is not None else tcp_cfg.get("port")
     if not port_value:
-        raise SystemExit(f"{method.name}: missing tcp.port")
+        raise RuntimeError(f"{method.name}: missing tcp.port")
     port = int(port_value)
     to_ms = int(tcp_cfg.get("timeout_ms", timeout_ms))
     svc_id, iface_ver, method_id = resolve_someip(cat, method)
@@ -923,8 +876,7 @@ def _tcp_call_with_response(
         iface_ver=iface_ver, msg_type=MT_REQUEST, payload=payload,
     )
     if verbose:
-        print(f"[tcp] connect {tcp_ip}:{port} method={method.name}")
-        print(f"      write: {values}")
+        print(f"[tcp] {tcp_ip}:{port} {method.name} write={values}")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(max(to_ms, 1) / 1000.0)
@@ -934,23 +886,23 @@ def _tcp_call_with_response(
     sock.close()
 
     if hdr.msg_type != MT_RESPONSE:
-        raise SystemExit(f"TCP: expected RESPONSE got 0x{hdr.msg_type:02X}")
+        raise RuntimeError(f"TCP: expected RESPONSE got 0x{hdr.msg_type:02X}")
 
     if _e2e_enabled(method):
         pl_core, counter = e2e_unwrap(pl)
         if counter != hdr.session_id:
-            raise SystemExit("TCP: E2E counter mismatch")
+            raise RuntimeError("TCP: E2E counter mismatch")
     else:
         pl_core = pl
 
-    response_vals = decode(sigs, pl_core)
+    response = decode(sigs, pl_core)
     if verbose:
-        print(f"      response: {response_vals}")
-    return response_vals
+        print(f"[tcp] response={response}")
+    return response
 
 
 def _client_connect(cat: Catalog, net: NetworkConfig) -> Optional[ClientContext]:
-    """Gather connection params. Returns ClientContext or None to go back."""
+    """Gather connection params."""
     _header("Client — Connection")
     sd_group, sd_port, _, _ = get_discovery_cfg(cat)
 
@@ -991,49 +943,68 @@ def _client_connect(cat: Catalog, net: NetworkConfig) -> Optional[ClientContext]
     )
 
 
-def _sig_index_for(cat: Catalog) -> SignalIndex:
-    return SignalIndex.from_signals(cat.signals)
-
-
 def _client_auto(ctx: ClientContext) -> None:
-    """Subscribe all events + call all methods with defaults, then block."""
+    """Subscribe all events, then allow method calls interactively."""
     _header("Client — Automatic mode")
+    
     events  = [m for m in ctx.cat.messages if m.kind == "event"  and m.transport == "udp"]
     methods = [m for m in ctx.cat.messages if m.kind == "method" and m.transport == "tcp"]
 
+    # Subscribe to all events
     for event in events:
         ctx.toggle_sub(event)
-        print(f"  Subscribed to {event.name}")
+        print(f"  Subscribed: {event.name}")
 
-    for method in methods:
-        values = {n: float(ctx.sig_index.by_name[n].default) for n in method.signals}
-        print(f"  Calling {method.name} with defaults {values}")
-        try:
-            response = _tcp_call_with_response(
-                cat=ctx.cat, method=method, sig_index=ctx.sig_index,
-                tcp_ip=ctx.server_ip, tcp_port=None,
-                values=values, timeout_ms=500, verbose=ctx.verbose,
-            )
-            ctx._method_calls[method.name] = ctx._method_calls.get(method.name, 0) + 1
-            print(f"    Response: {response}")
-        except (SystemExit, TimeoutError, OSError, ConnectionRefusedError) as e:
-            print(f"  TCP error ({method.name}): {e}")
-
-    print("\n  Commands:")
-    print("    [s] Show status    [q] Quit\n")
+    print()
+    print("  Commands:  [s] status  [m] call method  [q] quit")
+    print()
 
     while True:
         cmd = _prompt("> ")
         if cmd.lower() == "q":
             break
         elif cmd.lower() == "s":
-            print("\n  ── Status ──")
+            print("\n  ── Subscription Status ──")
             for event in events:
                 rx = ctx.get_rx_count(event.name)
                 last = ctx.get_last_values(event.name)
                 print(f"    {event.name}: rx={rx}")
                 if last:
-                    print(f"       last: {last}")
+                    for k, v in last.items():
+                        sig = ctx.sig_index.by_name.get(k)
+                        unit = sig.unit if sig else ""
+                        print(f"       {k}: {v:.2f} {unit}")
+            print()
+        elif cmd.lower() == "m":
+            print("\n  ── Methods ──")
+            for idx, m in enumerate(methods, start=1):
+                sigs = ", ".join(m.signals)
+                print(f"    [{idx}] {m.name}  signals=[{sigs}]")
+            print("    [b] Back")
+            
+            sel = _prompt("  Select method: ")
+            if sel.lower() == "b":
+                continue
+            try:
+                n = int(sel)
+                if 1 <= n <= len(methods):
+                    method = methods[n - 1]
+                    values: Dict[str, float] = {}
+                    for sig_name in method.signals:
+                        default = float(ctx.sig_index.by_name[sig_name].default)
+                        values[sig_name] = _ask_float(f"    {sig_name}", default)
+                    
+                    try:
+                        response = _tcp_call(
+                            cat=ctx.cat, method=method, sig_index=ctx.sig_index,
+                            tcp_ip=ctx.server_ip, tcp_port=None,
+                            values=values, timeout_ms=500, verbose=ctx.verbose,
+                        )
+                        print(f"  Response: {response}")
+                    except Exception as e:
+                        print(f"  Error: {e}")
+            except ValueError:
+                pass
             print()
 
     ctx.stop_all()
@@ -1041,47 +1012,43 @@ def _client_auto(ctx: ClientContext) -> None:
 
 
 def _client_manual(ctx: ClientContext) -> None:
-    """Interactive: toggle subscriptions, one-shot method calls."""
+    """Toggle subscriptions and call methods interactively."""
     _header("Client — Manual mode")
 
     events  = [m for m in ctx.cat.messages if m.kind == "event"  and m.transport == "udp"]
     methods = [m for m in ctx.cat.messages if m.kind == "method" and m.transport == "tcp"]
 
-    def _show() -> None:
+    def _show_menu() -> None:
         print()
-        print("  Events:")
+        print("  ── Events (toggle subscription) ──")
         for idx, ev in enumerate(events, start=1):
             if ctx.is_subscribed(ev.name):
                 rx = ctx.get_rx_count(ev.name)
                 state = f"ON  rx={rx}"
             else:
                 state = "OFF"
-            udp    = ev.udp or {}
-            mode   = str(udp.get("mode", "unicast"))
-            egid   = resolve_eventgroup_id(ev)
             period = ev.period_ms or "?"
-            print(f"    [{idx}] {ev.name:<22} [{state:<12}]  {mode}  egid=0x{egid:04X}  {period}ms")
+            print(f"    [{idx}] {ev.name:<26} [{state:<12}] {period}ms")
 
         print()
-        print("  Methods (one-shot):")
+        print("  ── Methods (one-shot call) ──")
         base = len(events)
         for idx, m in enumerate(methods, start=base + 1):
-            port = int((m.tcp or {}).get("port", 0))
+            sigs = ", ".join(m.signals)
             calls = ctx._method_calls.get(m.name, 0)
             call_info = f"calls={calls}" if calls > 0 else ""
-            print(f"    [{idx}] {m.name:<22} [TCP]  port={port}  {call_info}")
+            print(f"    [{idx}] {m.name:<26} signals=[{sigs}] {call_info}")
 
         print()
-        print("  [s] Show values  [b] Back (stops all subscriptions)")
+        print("  Commands:  [s] show values  [b] back")
 
-    _show()
+    _show_menu()
 
     while True:
         cmd = _prompt("> ")
-        if cmd.lower() in ("b", "q"):
+        if cmd.lower() == "b":
             break
-
-        if cmd.lower() == "s":
+        elif cmd.lower() == "s":
             print("\n  ── Current Values ──")
             for ev in events:
                 if ctx.is_subscribed(ev.name):
@@ -1092,47 +1059,44 @@ def _client_manual(ctx: ClientContext) -> None:
                         for k, v in last.items():
                             sig = ctx.sig_index.by_name.get(k)
                             unit = sig.unit if sig else ""
-                            print(f"       {k:<22} = {v:>10.2f} {unit}")
+                            print(f"       {k}: {v:.2f} {unit}")
             print()
-            _show()
-            continue
-
-        try:
-            n = int(cmd)
-        except ValueError:
-            _show()
-            continue
-
-        base = len(events)
-
-        if 1 <= n <= base:
-            event = events[n - 1]
-            now   = ctx.toggle_sub(event, quiet=False)  # Show messages in manual mode
-            print(f"  {event.name} → {'SUBSCRIBED' if now else 'UNSUBSCRIBED'}")
-            _show()
-
-        elif base + 1 <= n <= base + len(methods):
-            method = methods[n - base - 1]
-            print(f"  Calling {method.name}")
-            values: Dict[str, float] = {}
-            for sig_name in method.signals:
-                default = float(ctx.sig_index.by_name[sig_name].default)
-                values[sig_name] = _ask_float(f"    {sig_name}", default)
-
-            try:
-                response = _tcp_call_with_response(
-                    cat=ctx.cat, method=method, sig_index=ctx.sig_index,
-                    tcp_ip=ctx.server_ip, tcp_port=None,
-                    values=values, timeout_ms=500, verbose=ctx.verbose,
-                )
-                ctx._method_calls[method.name] = ctx._method_calls.get(method.name, 0) + 1
-                print(f"    Response: {response}")
-            except (SystemExit, TimeoutError, OSError, ConnectionRefusedError) as e:
-                print(f"  TCP error ({method.name}): {e}")
-            _show()
+            _show_menu()
         else:
-            print("  Out of range.")
-            _show()
+            try:
+                n = int(cmd)
+                base = len(events)
+                
+                if 1 <= n <= base:
+                    # Toggle event subscription
+                    event = events[n - 1]
+                    now = ctx.toggle_sub(event, quiet=False)
+                    print(f"  {event.name} → {'SUBSCRIBED' if now else 'UNSUBSCRIBED'}")
+                
+                elif base + 1 <= n <= base + len(methods):
+                    # Call method
+                    method = methods[n - base - 1]
+                    print(f"  Calling {method.name}")
+                    values: Dict[str, float] = {}
+                    for sig_name in method.signals:
+                        default = float(ctx.sig_index.by_name[sig_name].default)
+                        values[sig_name] = _ask_float(f"    {sig_name}", default)
+                    
+                    try:
+                        response = _tcp_call(
+                            cat=ctx.cat, method=method, sig_index=ctx.sig_index,
+                            tcp_ip=ctx.server_ip, tcp_port=None,
+                            values=values, timeout_ms=500, verbose=ctx.verbose,
+                        )
+                        ctx._method_calls[method.name] = ctx._method_calls.get(method.name, 0) + 1
+                        print(f"  Response: {response}")
+                    except Exception as e:
+                        print(f"  Error: {e}")
+                else:
+                    print("  Invalid number.")
+            except ValueError:
+                pass
+            _show_menu()
 
     ctx.stop_all()
     print("  All subscriptions stopped.")
@@ -1145,8 +1109,8 @@ def menu_client(cat: Catalog, sig_index: SignalIndex, net: NetworkConfig) -> Non
 
     while True:
         _header("Client")
-        print("  [1] Automatic  — subscribe all events + call all methods")
-        print("  [2] Manual     — toggle subscriptions, call methods one-shot")
+        print("  [1] Automatic  — subscribe all events")
+        print("  [2] Manual     — toggle subscriptions, call methods")
         print("  [b] Back")
         cmd = _prompt("> ")
 
@@ -1159,7 +1123,7 @@ def menu_client(cat: Catalog, sig_index: SignalIndex, net: NetworkConfig) -> Non
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Top-level menu
+# Main menu
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -1173,7 +1137,7 @@ def main() -> int:
     net       = load_network_config(args.network)
 
     while True:
-        _header("AutoEth")
+        _header("AutoEth TUI")
         print("  [1] Server")
         print("  [2] Client")
         print("  [q] Quit")

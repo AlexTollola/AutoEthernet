@@ -176,8 +176,11 @@ class ServerContext:
         self._tcp_servers: List[TcpServer]          = []
         self._sd_announcer: Optional[SdAnnouncer]   = None
         self._sd_listener:  Optional[SdListener]    = None
-        # name → running UdpEventPublisher
-        self._publishers: Dict[str, UdpEventPublisher] = {}
+        # name → (running publisher, stop_event, tx_count)
+        self._publishers: Dict[str, Tuple[threading.Thread, threading.Event]] = {}
+
+        # Track TX counts for display
+        self._tx_counts: Dict[str, int] = {}
 
     # ── Start TCP + SD (always on) ────────────────────────────────────────────
     def start_infrastructure(self) -> None:
@@ -226,53 +229,20 @@ class ServerContext:
     def is_publishing(self, name: str) -> bool:
         return name in self._publishers
 
-    def start_event(self, name: str) -> None:
+    def get_tx_count(self, name: str) -> int:
+        """Get the TX count for a publisher."""
         if name in self._publishers:
-            return
-        route = self.udp_events[name]
-        t = UdpEventPublisher(
-            route=route,
-            state=self.state, state_lock=self.state_lock,
-            stop_evt=self.stop_evt,
-            registry=self.registry,
-            dest_ip="127.0.0.1",
-            verbose=self.verbose,
-        )
-        t.start()
-        self._publishers[name] = t
-
-    def stop_event(self, name: str) -> None:
-        t = self._publishers.pop(name, None)
-        # We can't stop a single thread cleanly without its own stop event,
-        # so we mark it by replacing with a fresh one that never starts.
-        # The running thread will complete its next sleep and check stop_evt,
-        # which we signal here just for this thread using a private stop event.
-        # Instead: give each publisher its own stop event.
-        # (See _make_publisher for the per-thread approach.)
-        pass  # handled by _make_publisher below
-
-    def _make_publisher(self, name: str) -> None:
-        """Create publisher with its own stop event for individual toggling."""
-        if name in self._publishers:
-            return
-        route       = self.udp_events[name]
-        pub_stop    = threading.Event()
-        t = _IndividualPublisher(
-            route=route,
-            state=self.state, state_lock=self.state_lock,
-            stop_evt=pub_stop,
-            global_stop=self.stop_evt,
-            registry=self.registry,
-            dest_ip="127.0.0.1",
-            verbose=self.verbose,
-        )
-        t.start()
-        self._publishers[name] = (t, pub_stop)   # type: ignore[assignment]
+            pub, _ = self._publishers[name]
+            if hasattr(pub, '_inner'):
+                return pub._inner.seq
+            elif hasattr(pub, 'seq'):
+                return pub.seq
+        return 0
 
     def toggle_event(self, name: str) -> bool:
         """Toggle publisher. Returns new state (True = now publishing)."""
         if name in self._publishers:
-            t, stop = self._publishers.pop(name)  # type: ignore[misc]
+            t, stop = self._publishers.pop(name)
             stop.set()
             return False
         else:
@@ -288,7 +258,7 @@ class ServerContext:
                 verbose=self.verbose,
             )
             t.start()
-            self._publishers[name] = (t, pub_stop)  # type: ignore[assignment]
+            self._publishers[name] = (t, pub_stop)
             return True
 
     def start_all_events(self) -> None:
@@ -301,7 +271,7 @@ class ServerContext:
         self.stop_evt.set()
         # Stop individual publishers
         for name in list(self._publishers.keys()):
-            _, pub_stop = self._publishers.pop(name)  # type: ignore[misc]
+            _, pub_stop = self._publishers.pop(name)
             pub_stop.set()
         for srv in self._tcp_servers:
             srv.stop()
@@ -337,7 +307,8 @@ class EventSubscription(threading.Thread):
 
     def __init__(self, *, cat: Catalog, event: MessageDef,
                  sig_index: SignalIndex, bind_ip: str, iface_ip: str,
-                 timeout_s: float = 1.0, verbose: bool = False) -> None:
+                 timeout_s: float = 1.0, verbose: bool = False,
+                 quiet: bool = False) -> None:
         super().__init__(daemon=True)
         self.cat       = cat
         self.event     = event
@@ -345,6 +316,7 @@ class EventSubscription(threading.Thread):
         self.bind_ip   = bind_ip
         self.iface_ip  = iface_ip
         self.verbose   = verbose
+        self.quiet     = quiet  # If True, don't print each message
         self._stop     = threading.Event()
 
         udp_cfg    = event.udp or {}
@@ -358,6 +330,7 @@ class EventSubscription(threading.Thread):
         self.eid     = eid
         self.sigs    = sig_index.subset(event.signals)
         self.count   = 0
+        self.last_values: Optional[Dict[str, float]] = None
 
     def stop(self) -> None:
         self._stop.set()
@@ -371,7 +344,12 @@ class EventSubscription(threading.Thread):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.settimeout(1.0)
-        s.bind((self.bind_ip, self.port))
+        
+        # For multicast, must bind to 0.0.0.0 (not interface IP) to receive group traffic
+        if self.mode == "multicast":
+            s.bind(("0.0.0.0", self.port))
+        else:
+            s.bind((self.bind_ip, self.port))
         self._sock = s
 
         if self.mode == "multicast" and self.group:
@@ -409,13 +387,16 @@ class EventSubscription(threading.Thread):
                 continue
 
             self.count += 1
-            print(
-                f"\n  [rx] {self.event.name}  #{self.count}"
-                f"  sid=0x{hdr.service_id:04X}  sess={hdr.session_id}"
-                f"  {vals}"
-                f"\n> ",
-                end="", flush=True,
-            )
+            self.last_values = vals
+
+            if not self.quiet:
+                print(
+                    f"\n  [rx] {self.event.name}  #{self.count}"
+                    f"  sid=0x{hdr.service_id:04X}  sess={hdr.session_id}"
+                    f"\n       {vals}"
+                    f"\n> ",
+                    end="", flush=True,
+                )
 
         try:
             s.close()
@@ -452,12 +433,23 @@ def _server_auto(cat: Catalog, sig_index: SignalIndex, cfg: dict) -> None:
     print(f"  TCP ports  : {ports}")
     print(f"  UDP events : {events}")
     print(f"  SD group   : {cfg['sd_group']}:{cfg['sd_port']}")
-    print("\n  Running — press [q] + Enter to stop.\n")
+    print("\n  Running — press [q] + Enter to stop.")
+    print("  Press [s] + Enter to show status.\n")
 
     while True:
         cmd = _prompt("> ")
         if cmd.lower() == "q":
             break
+        elif cmd.lower() == "s":
+            print("\n  ── Status ──")
+            for name in events:
+                tx = ctx.get_tx_count(name)
+                subs = len(ctx.registry.get_subscribers(
+                    ctx.udp_events[name].svc_id,
+                    ctx.udp_events[name].eventgroup_id
+                ))
+                print(f"  {name}: tx={tx}  subscribers={subs}")
+            print()
 
     ctx.stop_all()
     print("  Server stopped.")
@@ -478,16 +470,21 @@ def _server_manual(cat: Catalog, sig_index: SignalIndex, cfg: dict) -> None:
     def _show_events() -> None:
         print()
         for idx, name in enumerate(events, start=1):
-            state  = "ON " if name in ctx._publishers else "OFF"
+            if name in ctx._publishers:
+                tx = ctx.get_tx_count(name)
+                state = f"ON  tx={tx}"
+            else:
+                state = "OFF"
             route  = ctx.udp_events[name]
             period = route.msg.period_ms or "?"
             mode   = str((route.msg.udp or {}).get("mode", "unicast"))
-            print(f"  [{idx}] {name:<28} [{state}]  {period}ms  {mode}")
+            subs   = len(ctx.registry.get_subscribers(route.svc_id, route.eventgroup_id))
+            print(f"  [{idx}] {name:<25} [{state:<12}]  {period}ms  {mode}  subs={subs}")
         methods = [r.msg for r in ctx.routes.values()]
         print()
         for idx, m in enumerate(methods, start=len(events) + 1):
             port = int((m.tcp or {}).get("port", 0))
-            print(f"  [{idx}] {m.name:<28} [TCP]  port={port}  (always on)")
+            print(f"  [{idx}] {m.name:<25} [TCP]  port={port}  (always on)")
         print()
         print("  [b] Back / stop server")
 
@@ -553,11 +550,23 @@ class ClientContext:
         self.verbose    = verbose
         # name → EventSubscription
         self._subs: Dict[str, EventSubscription] = {}
+        # Track method call counts
+        self._method_calls: Dict[str, int] = {}
 
     def is_subscribed(self, name: str) -> bool:
         return name in self._subs
 
-    def toggle_sub(self, event: MessageDef) -> bool:
+    def get_rx_count(self, name: str) -> int:
+        """Get the RX count for a subscription."""
+        sub = self._subs.get(name)
+        return sub.count if sub else 0
+
+    def get_last_values(self, name: str) -> Optional[Dict[str, float]]:
+        """Get the last received values for a subscription."""
+        sub = self._subs.get(name)
+        return sub.last_values if sub else None
+
+    def toggle_sub(self, event: MessageDef, quiet: bool = False) -> bool:
         name = event.name
         if name in self._subs:
             self._subs.pop(name).stop()
@@ -588,7 +597,7 @@ class ClientContext:
             sub = EventSubscription(
                 cat=self.cat, event=event, sig_index=self.sig_index,
                 bind_ip=self.bind_ip, iface_ip=self.iface_ip,
-                verbose=self.verbose,
+                verbose=self.verbose, quiet=quiet,
             )
             sub.start()
             self._subs[name] = sub
@@ -696,14 +705,26 @@ def _client_auto(ctx: ClientContext) -> None:
                 tcp_ip=ctx.server_ip, tcp_port=None,
                 values=values, timeout_ms=500, verbose=ctx.verbose,
             )
+            ctx._method_calls[method.name] = ctx._method_calls.get(method.name, 0) + 1
         except (SystemExit, TimeoutError, OSError, ConnectionRefusedError) as e:
             print(f"  TCP error ({method.name}): {e}")
 
-    print("\n  Receiving — press [q] + Enter to stop.\n")
+    print("\n  Receiving — press [q] + Enter to stop.")
+    print("  Press [s] + Enter to show status.\n")
+
     while True:
         cmd = _prompt("> ")
         if cmd.lower() == "q":
             break
+        elif cmd.lower() == "s":
+            print("\n  ── Status ──")
+            for event in events:
+                rx = ctx.get_rx_count(event.name)
+                last = ctx.get_last_values(event.name)
+                print(f"  {event.name}: rx={rx}")
+                if last:
+                    print(f"       last: {last}")
+            print()
 
     ctx.stop_all()
     print("  Client stopped.")
@@ -720,23 +741,29 @@ def _client_manual(ctx: ClientContext) -> None:
         print()
         print("  Events:")
         for idx, ev in enumerate(events, start=1):
-            state  = "ON " if ctx.is_subscribed(ev.name) else "OFF"
+            if ctx.is_subscribed(ev.name):
+                rx = ctx.get_rx_count(ev.name)
+                state = f"ON  rx={rx}"
+            else:
+                state = "OFF"
             udp    = ev.udp or {}
             mode   = str(udp.get("mode", "unicast"))
             egid   = resolve_eventgroup_id(ev)
             period = ev.period_ms or "?"
-            print(f"  [{idx}] {ev.name:<28} [{state}]  {mode}  egid=0x{egid:04X}  {period}ms")
+            print(f"  [{idx}] {ev.name:<25} [{state:<12}]  {mode}  egid=0x{egid:04X}  {period}ms")
 
         print()
         print("  Methods (one-shot):")
         base = len(events)
         for idx, m in enumerate(methods, start=base + 1):
             port = int((m.tcp or {}).get("port", 0))
+            calls = ctx._method_calls.get(m.name, 0)
             sigs = ", ".join(m.signals)
-            print(f"  [{idx}] {m.name:<28} [TCP]  port={port}  signals=[{sigs}]")
+            call_info = f"calls={calls}" if calls > 0 else ""
+            print(f"  [{idx}] {m.name:<25} [TCP]  port={port}  {call_info}")
 
         print()
-        print("  [b] Back (stops all subscriptions)")
+        print("  [s] Show status  [b] Back (stops all subscriptions)")
 
     _show()
 
@@ -744,6 +771,18 @@ def _client_manual(ctx: ClientContext) -> None:
         cmd = _prompt("> ")
         if cmd.lower() in ("b", "q"):
             break
+
+        if cmd.lower() == "s":
+            print("\n  ── Current Values ──")
+            for ev in events:
+                if ctx.is_subscribed(ev.name):
+                    rx = ctx.get_rx_count(ev.name)
+                    last = ctx.get_last_values(ev.name)
+                    print(f"  {ev.name}: rx={rx}")
+                    if last:
+                        print(f"       {last}")
+            print()
+            continue
 
         try:
             n = int(cmd)
@@ -755,7 +794,7 @@ def _client_manual(ctx: ClientContext) -> None:
 
         if 1 <= n <= base:
             event = events[n - 1]
-            now   = ctx.toggle_sub(event)
+            now   = ctx.toggle_sub(event, quiet=True)
             print(f"  {event.name} → {'SUBSCRIBED' if now else 'UNSUBSCRIBED'}")
             _show()
 
@@ -773,6 +812,7 @@ def _client_manual(ctx: ClientContext) -> None:
                     tcp_ip=ctx.server_ip, tcp_port=None,
                     values=values, timeout_ms=500, verbose=ctx.verbose,
                 )
+                ctx._method_calls[method.name] = ctx._method_calls.get(method.name, 0) + 1
             except (SystemExit, TimeoutError, OSError, ConnectionRefusedError) as e:
                 print(f"  TCP error ({method.name}): {e}")
             _show()
